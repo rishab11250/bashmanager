@@ -1,0 +1,20 @@
+# Node
+node_modules/
+dist/
+build/
+*.AppImage
+*.exe
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.venv/
+.env
+
+# DevShell specifics
+favorites.json
+locks.json

@@ -1,0 +1,47 @@
+{
+  "name": "devshell",
+  "productName": "DevShell",
+  "version": "1.0.0",
+  "description": "A DevOps-style bash script manager with a premium UI for organizing and executing shell scripts.",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build:linux": "electron-builder --linux AppImage"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/siddu-k/bashmanager.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/siddu-k/bashmanager/issues"
+  },
+  "homepage": "https://github.com/siddu-k/bashmanager#readme",
+  "build": {
+    "appId": "com.devshell.app",
+    "productName": "DevShell",
+    "directories": {
+      "output": "dist"
+    },
+    "linux": {
+      "target": "AppImage",
+      "category": "Development"
+    },
+    "files": [
+      "main.js",
+      "app.py",
+      "ui/**/*",
+      "scripts/**/*"
+    ],
+    "extraResources": [
+      "favorites.json"
+    ]
+  },
+  "devDependencies": {
+    "electron": "^33.4.11",
+    "electron-builder": "^26.8.1"
+  }
+}
