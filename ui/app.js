@@ -2,6 +2,9 @@
    DevShell — Frontend Logic (CLI + Analysis + Locks + GitHub)
    ═══════════════════════════════════════════════════════════ */
 
+const MAX_NOTIFICATIONS = 5;
+const NOTIFICATION_DURATION = 5000;
+
 const API = {
     scripts: '/api/scripts',
     content: '/api/scripts/content',
@@ -342,10 +345,11 @@ async function saveScript(category, filename, content) {
             await loadScripts();
             closeModal();
             selectScript(data.path);
+            notify('Script saved successfully.', 'success');
         }
     } catch (err) {
         console.error('Failed to save script:', err);
-        alert('Failed to save script: ' + err.message);
+        notify(`Failed to save script: ${err.message}`, 'error');
     }
 }
 
@@ -409,12 +413,13 @@ async function importGithubScript(url, category, filename) {
             document.getElementById('github-modal-overlay').classList.remove('active');
             selectScript(data.path);
             appendToCli(`✓ Imported script from GitHub: ${data.path}`, 'success');
+            notify('Script imported successfully.', 'success');
         } else {
-            alert('Import failed: ' + data.error);
+            notify(`Import failed: ${data.error}`, 'error');
         }
     } catch (err) {
         console.error('Import error:', err);
-        alert('Exception during import: ' + err.message);
+        notify(`Exception during import: ${err.message}`, 'error');
     }
 }
 
@@ -424,14 +429,14 @@ async function importGithubScript(url, category, filename) {
 function raisePRFlow(relPath) {
     const overlay = document.getElementById('pr-modal-overlay');
     if (!overlay) return;
-    
+
     // Set default values based on script path to speed up workflow
     const defaultBranch = `contrib-${relPath.replace(/\//g, '-').replace('.sh', '')}`;
     const defaultMsg = `Update/Add script: ${relPath}`;
-    
+
     document.getElementById('pr-branch').value = defaultBranch;
     document.getElementById('pr-message').value = defaultMsg;
-    
+
     overlay.classList.add('active');
 }
 
@@ -465,18 +470,18 @@ async function executePR(relPath, branch, message, repoUrl) {
                 DebuggerConsole.addEntry('log', `🔗 PR Link: ${data.pr_url}`, 'git');
             }
             appendToCli(`✓ Git PR branch '${data.branch}' created and pushed.`, 'success');
-            
+
             // Offer to automatically open the GitHub Pull Request page
             if (confirm(`Successfully pushed to branch '${data.branch}'.\n\nWould you like to open the Pull Request page on GitHub?`)) {
                 window.open(data.pr_url, '_blank');
             }
         } else {
             if (typeof DebuggerConsole !== 'undefined') DebuggerConsole.addEntry('error', `❌ Git PR failed: ${data.error}`, 'git');
-            alert('PR Workflow failed: ' + data.error);
+            notify(`PR workflow failed: ${data.error}`, 'error');
         }
     } catch (err) {
         if (typeof DebuggerConsole !== 'undefined') DebuggerConsole.addEntry('error', `❌ Git PR Exception: ${err.message}`, 'git');
-        alert('Exception during PR workflow: ' + err.message);
+        notify(`Exception during PR workflow: ${err.message}`, 'error');
     }
 }
 
@@ -490,7 +495,7 @@ async function manageLock(relPath, oldPass, newPass) {
         const data = await res.json();
 
         if (!data.success) {
-            alert('Failed: ' + data.error);
+            notify(`Lock operation failed: ${data.error}`, 'error');
             return false;
         }
 
@@ -805,7 +810,7 @@ async function selectScript(relPath) {
         const unlockAction = async () => {
             const content = await fetchScriptContent(relPath, passInput.value);
             if (content.locked) {
-                alert('Incorrect password!');
+                notify('Incorrect password.', 'error');
             } else {
                 state.unlockedScripts[relPath] = passInput.value;
                 selectScript(relPath);
@@ -1040,8 +1045,6 @@ function bindEvents() {
     const btnFav = document.getElementById('btn-fav');
     if (btnFav) btnFav.addEventListener('click', () => { if (state.activeScript) toggleFavorite(state.activeScript); });
 
-
-
     // Clear terminal
     document.getElementById('btn-clear').addEventListener('click', clearCli);
     document.getElementById('btn-close-detail').addEventListener('click', showWelcome);
@@ -1056,9 +1059,17 @@ function bindEvents() {
         const filename = document.getElementById('modal-filename').value.trim();
         const content = document.getElementById('modal-editor').value;
 
-        if (!category) return alert('Please enter a category name');
-        if (!filename) return alert('Please enter a filename');
-        if (!content.trim()) return alert('Please enter script content');
+        if (!category) {
+            return notify('Please enter a category name.', 'warning');
+        }
+
+        if (!filename) {
+            return notify('Please enter a filename.', 'warning');
+        }
+
+        if (!content.trim()) {
+            return notify('Please enter script content.', 'warning');
+        }
 
         saveScript(category, filename, content);
     });
@@ -1084,7 +1095,9 @@ function bindEvents() {
             const category = document.getElementById('github-category').value;
             const filename = document.getElementById('github-filename').value;
 
-            if (!url || !category || !filename) return alert("All fields are required!");
+            if (!url || !category || !filename) {
+                return notify('All GitHub import fields are required.', 'warning');
+            }
             importGithubScript(url, category, filename);
         });
     }
@@ -1102,7 +1115,7 @@ function bindEvents() {
             const branch = document.getElementById('pr-branch').value.trim();
             const message = document.getElementById('pr-message').value.trim();
             if (!branch || !message) {
-                alert("Both branch name and commit message are required.");
+                notify('Both branch name and commit message are required.', 'warning');
                 return;
             }
             if (state.activeScript) {
@@ -1166,13 +1179,20 @@ function bindEvents() {
             } else {
                 oldPass = '';
                 newPass = document.getElementById('lock-new-pass').value;
-                if (!newPass) return alert("Password cannot be empty when setting a lock!");
+                if (!newPass) {
+                    return notify('Password cannot be empty when setting a lock.', 'warning');
+                }
             }
 
             const success = await manageLock(state.activeScript, oldPass, newPass);
             if (success) {
+                notify(
+                    isLocked
+                        ? 'Script lock removed successfully.'
+                        : 'Script locked successfully.',
+                    'success'
+                );
                 if (!isLocked && newPass) {
-                    // Instantly lock screen up by clearing session
                     delete state.unlockedScripts[state.activeScript];
                     selectScript(state.activeScript);
                 } else if (isLocked && !newPass) {
@@ -1195,6 +1215,82 @@ function escapeHtml(text) {
 
 function escapeAttr(text) {
     return text.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function removeNotification(notification) {
+    if (!notification || notification.classList.contains('removing')) {
+        return;
+    }
+
+    notification.classList.add('removing');
+
+    notification.addEventListener('animationend', () => {
+        notification.remove();
+    }, { once: true });
+}
+
+function notify(message, type = 'info') {
+    const container = document.getElementById('notification-container');
+
+    if (!container) {
+        console.warn('Notification container missing');
+        return;
+    }
+
+    const existingNotifications = container.querySelectorAll('.notification');
+
+    if (existingNotifications.length >= MAX_NOTIFICATIONS) {
+        removeNotification(existingNotifications[0]);
+    }
+
+    const notification = document.createElement('div');
+    notification.className = `notification ${type}`;
+    notification.setAttribute('role', 'status');
+
+    notification.setAttribute(
+        'aria-live',
+        type === 'error' ? 'assertive' : 'polite'
+    );
+
+    const content = document.createElement('div');
+    content.className = 'notification-content';
+
+    const messageElement = document.createElement('div');
+    messageElement.className = 'notification-message';
+
+    // Safe rendering
+    messageElement.textContent = message;
+
+    content.appendChild(messageElement);
+
+    const closeButton = document.createElement('button');
+    closeButton.className = 'notification-close';
+    closeButton.setAttribute('aria-label', 'Dismiss notification');
+    closeButton.textContent = '×';
+
+    closeButton.addEventListener('click', () => {
+        removeNotification(notification);
+    });
+
+    notification.appendChild(content);
+    notification.appendChild(closeButton);
+
+    container.appendChild(notification);
+
+    let timeout = setTimeout(() => {
+        removeNotification(notification);
+    }, NOTIFICATION_DURATION);
+
+    notification.addEventListener('mouseenter', () => {
+        clearTimeout(timeout);
+    });
+
+    notification.addEventListener('mouseleave', () => {
+        clearTimeout(timeout);
+        timeout = setTimeout(() => {
+            removeNotification(notification);
+        }, 2000);
+    });
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1345,16 +1441,16 @@ const DebuggerConsole = (() => {
             const parts = q.split('.');
             const prefix = parts.slice(0, -1).join('.');
             const lastPart = parts[parts.length - 1];
-            
+
             // For now, just handle top-level properties of 'state'
             if (typeof state !== 'undefined') {
                 Object.keys(state).forEach(key => {
                     if (key.toLowerCase().startsWith(lastPart)) {
-                        stateSugs.push({ 
-                            cmd: `${prefix}.${key}`, 
-                            desc: `Property: ${typeof state[key]}`, 
-                            icon: 'debug', 
-                            category: 'debug' 
+                        stateSugs.push({
+                            cmd: `${prefix}.${key}`,
+                            desc: `Property: ${typeof state[key]}`,
+                            icon: 'debug',
+                            category: 'debug'
                         });
                     }
                 });
@@ -1374,10 +1470,10 @@ const DebuggerConsole = (() => {
 
         // 3. Static suggestions
         const matched = SUGGESTIONS.filter(s => s.cmd.toLowerCase().includes(q) || s.desc.toLowerCase().includes(q));
-        
+
         // Combine all, prioritizing state property completions if they exist
         const all = [...stateSugs, ...scriptSugs, ...matched];
-        
+
         // Remove duplicates (by cmd)
         const unique = [];
         const seen = new Set();
@@ -1388,7 +1484,7 @@ const DebuggerConsole = (() => {
                 seen.add(item.cmd);
             }
         }
-        
+
         return unique.slice(0, 10);
     }
 
@@ -1458,7 +1554,7 @@ const DebuggerConsole = (() => {
             const result = eval(expr); // eslint-disable-line no-eval
             const output = (result === null) ? 'null' :
                 (result === undefined) ? 'undefined' :
-                typeof result === 'object' ? JSON.stringify(result, null, 2) : String(result);
+                    typeof result === 'object' ? JSON.stringify(result, null, 2) : String(result);
             addEntry('result', output);
         } catch (e) {
             addEntry('error', e.message, 'eval');
@@ -1569,9 +1665,9 @@ const DebuggerConsole = (() => {
         // Keyboard shortcuts
         document.addEventListener('keydown', (e) => {
             // Ctrl+` to toggle debugger
-            if ((e.ctrlKey || e.metaKey) && e.key === '`') { 
-                e.preventDefault(); 
-                toggle(); 
+            if ((e.ctrlKey || e.metaKey) && e.key === '`') {
+                e.preventDefault();
+                toggle();
             }
             // Ctrl+L to clear debugger (only if open)
             if (isOpen && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'l') {
