@@ -499,22 +499,63 @@ def get_script_content():
 
 
 def _track_metrics(proc, result):
-    cpu_percent = 0.0
     max_mem_mb = 0.0
     samples = 0
     total_cpu = 0.0
     try:
         p = psutil.Process(proc.pid)
+        # Prime cpu_percent counter for parent (first call always returns 0)
+        p.cpu_percent()
+
+        # Cache of pid → psutil.Process so cpu_percent() has prior baselines
+        tracked_children = {}
+
         while proc.poll() is None:
-            c = p.cpu_percent(interval=0.1)
-            # rss is resident set size (memory)
-            m = p.memory_info().rss / (1024 * 1024)
-            total_cpu += c
-            max_mem_mb = max(max_mem_mb, m)
+            time.sleep(0.1)
+            sample_cpu = 0.0
+            sample_mem = 0.0
+
+            # Discover current child pids
+            current_child_pids = set()
+            try:
+                for child in p.children(recursive=True):
+                    current_child_pids.add(child.pid)
+                    if child.pid not in tracked_children:
+                        tracked_children[child.pid] = child
+                        # Prime new child so next cycle gets a real delta
+                        try:
+                            child.cpu_percent()
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            pass
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+
+            # Remove stale entries for children that have exited
+            for stale_pid in list(tracked_children.keys()):
+                if stale_pid not in current_child_pids:
+                    del tracked_children[stale_pid]
+
+            # Measure parent
+            try:
+                sample_cpu += p.cpu_percent()
+                sample_mem += p.memory_info().rss / (1024 * 1024)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+
+            # Measure tracked children (reused objects → accurate cpu deltas)
+            for child_proc in tracked_children.values():
+                try:
+                    sample_cpu += child_proc.cpu_percent()
+                    sample_mem += child_proc.memory_info().rss / (1024 * 1024)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+
+            total_cpu += sample_cpu
+            max_mem_mb = max(max_mem_mb, sample_mem)
             samples += 1
-    except (psutil.NoSuchProcess, Exception):
+    except (psutil.NoSuchProcess, psutil.AccessDenied, Exception):
         pass
-    
+
     result['cpu'] = round(total_cpu / samples, 1) if samples > 0 else 0.0
     result['mem'] = round(max_mem_mb, 1)
 
