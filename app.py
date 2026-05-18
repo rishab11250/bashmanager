@@ -551,8 +551,9 @@ def run_script():
         proc = None
         start_time = time.time()
         try:
+            args = [shell_cmd, full_path] if shell_cmd != 'cmd.exe' else ['cmd.exe', '/c', full_path]
             proc = subprocess.Popen(
-                [shell_cmd, full_path],
+                args,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
