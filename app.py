@@ -602,6 +602,23 @@ def get_command_history():
         'history': load_command_history()
     })
 
+@app.route('/api/command_history/clear', methods=['POST'])
+def clear_command_history():
+    try:
+        # Overwrite the history JSON file with an empty array
+        with open(COMMAND_HISTORY_FILE, 'w', encoding='utf-8') as f:
+            json.dump([], f, indent=2)
+            
+        return jsonify({
+            'success': True,
+            'message': 'Command history cleared successfully'
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
 
 @app.route('/api/history/analytics')
 def history_analytics():

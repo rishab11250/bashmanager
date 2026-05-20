@@ -1918,6 +1918,39 @@ function bindEvents() {
     if (historyExportTxt) historyExportTxt.addEventListener('click', () => exportExecutionHistory('txt'));
     if (historyExportLog) historyExportLog.addEventListener('click', () => exportExecutionHistory('log'));
 
+    const historyClearBtn = document.getElementById('history-clear-btn');
+    if (historyClearBtn) {
+        historyClearBtn.addEventListener('click', async () => {
+            const confirmation = confirm('Are you sure you want to permanently clear your command history log?');
+            if (!confirmation) return;
+
+            try {
+                const response = await fetch('/api/command_history/clear', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                const result = await response.json();
+
+                if (result.success) {
+                    const targetDisplayList = document.getElementById('history-list');
+                    if (targetDisplayList) {
+                        targetDisplayList.innerHTML = '<div class="history-empty-state">Command history cleared successfully.</div>';
+                    }
+                    const targetSummaryWidget = document.getElementById('history-summary');
+                    if (targetSummaryWidget) {
+                        targetSummaryWidget.innerHTML = '';
+                    }
+                    notify('Command history cleared successfully!', 'success');
+                } else {
+                    notify('Server failed to clear history: ' + (result.error || 'Unknown error'), 'error');
+                }
+            } catch (err) {
+                console.error('Error clearing history:', err);
+                notify('An unexpected error occurred while communicating with the backend.', 'error');
+            }
+        });
+    }
+
     // Main Modal controls
     document.getElementById('modal-close').addEventListener('click', closeModal);
     document.getElementById('modal-cancel').addEventListener('click', closeModal);
