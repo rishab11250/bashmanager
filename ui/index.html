@@ -120,6 +120,10 @@
                     </div>
                     <span class="script-count" id="script-count">0</span>
                 </div>
+                <div class="sidebar-search-wrapper" style="padding: 10px 14px; border-bottom: 1px solid var(--border-color, #2d3139);">
+                    <input type="text" id="script-search-bar" placeholder="Filter scripts by name..." autocomplete="off" spellcheck="false" 
+                           style="width: 100%; padding: 6px 10px; background: #1e222b; border: 1px solid #2d3139; color: #fff; border-radius: 4px; font-size: 13px;">
+                </div>
 
                 <!-- Favorites Section -->
                 <div class="sidebar-section" id="favorites-section" style="display:none;">
@@ -621,6 +625,7 @@ echo 'Hello World'"></textarea>
                     <p class="history-modal-subtitle">Search command and script runs, inspect failures, and export logs.</p>
                 </div>
                 <div class="history-header-actions">
+                    <button class="btn btn-action btn-danger" id="history-clear-btn" style="margin-right: 8px; background-color: #dc3545; color: white;">Clear History</button>
                     <button class="btn btn-action" id="history-export-txt">Export .txt</button>
                     <button class="btn btn-action" id="history-export-log">Export .log</button>
                     <button class="btn-icon" id="history-modal-close" aria-label="Close history viewer">
