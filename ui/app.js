@@ -18,6 +18,7 @@ const API = {
     pr: '/api/git/pr',
     history: '/api/history',
     history_export: '/api/history/export',
+    kill: '/api/scripts/kill',
 };
 
 // ─── State ────────────────────────────────────────────────
@@ -31,13 +32,35 @@ let state = {
     historyQuery: '',
     historyFilter: 'all',
     historyEntries: [],
-    historySummary: { total: 0, failed: 0, successful: 0, scripts: 0, commands: 0 },
+    historySummary: {
+        total: 0,
+        failed: 0,
+        successful: 0,
+        scripts: 0,
+        commands: 0
+    },
+    replay: {
+        playing: false,
+        timer: null,
+        events: [],
+        index: 0,
+        speed: 1
+    },
     unlockedScripts: {}, // stores valid passwords for locked scripts: { "path": "pass" }
     terminals: [1],      // list of terminal IDs
     activeTerminalId: 1,
     nextTerminalId: 2,
     autoScroll: {},      // per-terminal auto-scroll toggle: { termId: bool }
+    workspaceRestored: false,
+    workspaceProfiles: [],
+    restoreMode: 'full',
+    workspaceRecoveryEnabled: true,
+    sessionId: null,
+    lastSaveTimestamp: 0,
+    runningScripts: {},  // termId -> { step, total, command, status }
 };
+
+const RUN_BUTTON_IDLE_HTML = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg><span>Run</span>`;
 
 // ─── SVG Icons ─────────────────────────────────────────────
 const ICONS = {
@@ -62,10 +85,71 @@ function getCategoryIcon(name) {
 }
 
 // ─── Init ──────────────────────────────────────────────────
-document.addEventListener('DOMContentLoaded', () => {
-    loadScripts();
+async function openAnalytics() {
+    try {
+        const res = await fetch('/api/history/analytics');
+        const data = await res.json();
+
+        if (!data.success) {
+            notify('Failed to load analytics.', 'error');
+            return;
+        }
+
+        const summary = data.summary;
+
+        document.getElementById('analytics-total').textContent = summary.total;
+        document.getElementById('analytics-success').textContent = summary.successful;
+        document.getElementById('analytics-failed').textContent = summary.failed;
+        document.getElementById('analytics-avg').textContent = `${summary.avg_duration}s`;
+
+        document.getElementById('analytics-top-scripts').innerHTML =
+            data.top_scripts.map(([name, count]) => `
+                <div class="analytics-item">
+                    ${escapeHtml(name)} — ${count} runs
+                </div>
+            `).join('');
+
+        document.getElementById('analytics-slowest').innerHTML =
+            data.slowest.map(entry => `
+                <div class="analytics-item">
+                    ${escapeHtml(entry.display_name)} — ${entry.duration_seconds}s
+                </div>
+            `).join('');
+
+        document.getElementById('analytics-failures').innerHTML =
+            data.recent_failures.map(entry => `
+                <div class="analytics-item">
+                    ${escapeHtml(entry.display_name)} — Exit ${entry.exit_code}
+                </div>
+            `).join('');
+
+        document.getElementById('analytics-modal-overlay').classList.add('active');
+
+    } catch (err) {
+        console.error(err);
+        notify(`Analytics failed: ${err.message}`, 'error');
+    }
+}
+
+async function loadCommandHistory() {
+    try {
+        const res = await fetch('/api/command_history');
+        const data = await res.json();
+
+        if (data.success) {
+            state.cmdHistory = data.history || [];
+        }
+    } catch (err) {
+        console.error('Failed to load command history:', err);
+    }
+}
+
+document.addEventListener('DOMContentLoaded', async () => {
+    await loadScripts();
+    await loadCommandHistory();
     bindEvents();
     initResizers();
+    await restoreSession();
 
     // Initialize auto-scroll as enabled for terminal 1
     state.autoScroll[1] = true;
@@ -169,17 +253,82 @@ async function fetchScriptContent(relPath, password = '') {
     }
 }
 
+function getTerminalBody(termId = state.activeTerminalId) {
+    return document.getElementById(`terminal-body-${termId}`)
+        || (termId === 1 ? document.getElementById('terminal-body') : null);
+}
+
+function updateRunButton() {
+    const btnRun = document.getElementById('btn-run');
+    if (!btnRun) return;
+
+    const running = state.runningScripts[state.activeTerminalId];
+    btnRun.classList.remove('running', 'abort', 'aborting');
+
+    if (running) {
+        btnRun.classList.add(running.aborting ? 'aborting' : 'abort');
+        btnRun.innerHTML = running.aborting
+            ? '<span style="margin-right: 6px;">x</span> Aborting...'
+            : '<span style="margin-right: 6px;">x</span> Abort';
+        btnRun.title = running.aborting ? 'Aborting script' : 'Abort script';
+        btnRun.setAttribute('aria-label', running.aborting ? 'Aborting script' : 'Abort script');
+    } else {
+        btnRun.innerHTML = RUN_BUTTON_IDLE_HTML;
+        btnRun.title = 'Run Script';
+        btnRun.setAttribute('aria-label', 'Run script');
+    }
+}
+
+async function abortScriptRun(termId = state.activeTerminalId) {
+    const running = state.runningScripts[termId];
+    if (!running) return;
+
+    running.abortRequested = true;
+    running.aborting = true;
+    updateRunButton();
+
+    if (!running.run_id || running.killSent) return;
+
+    running.killSent = true;
+    try {
+        const res = await fetch(API.kill, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ run_id: running.run_id }),
+        });
+
+        if (!res.ok && res.status !== 404) {
+            const data = await res.json().catch(() => ({}));
+            running.killSent = false;
+            running.aborting = false;
+            updateRunButton();
+            notify(data.error || 'Failed to abort script.', 'error');
+        }
+    } catch (e) {
+        running.killSent = false;
+        running.aborting = false;
+        updateRunButton();
+        notify(`Failed to abort script: ${e.message}`, 'error');
+    }
+}
+
 async function runScript(relPath) {
     const termId = state.activeTerminalId;
-    const btnRun = document.getElementById('btn-run');
+    if (state.runningScripts[termId]) return;
     const runStatus = document.getElementById('run-status');
     const resourcePanel = document.getElementById('resource-panel');
 
-    // Set running state
-    if (btnRun) {
-        btnRun.classList.add('running');
-        btnRun.innerHTML = '<span class="spinner" style="margin-right: 6px;"></span> Running...';
-    }
+    let runId = null;
+
+    state.runningScripts[termId] = {
+        run_id: null,
+        relPath,
+        abortRequested: false,
+        aborting: false,
+        killSent: false,
+    };
+    updateRunButton();
+
     if (termId === state.activeTerminalId) {
         runStatus.textContent = 'Executing...';
         runStatus.className = 'run-status running';
@@ -187,8 +336,18 @@ async function runScript(relPath) {
     }
 
     appendToCli(`$ Running script: ${relPath}`, 'system', termId);
-    // Mirror to debugger
     if (typeof DebuggerConsole !== 'undefined') DebuggerConsole.addEntry('info', `▶ Running script: ${relPath}`, 'script');
+
+    // Initialize progress tracker state for this terminal
+    state.runningScripts[termId] = {
+        step: 0,
+        total: 0,
+        command: 'Starting script...',
+        status: 'running'
+    };
+    if (termId === state.activeTerminalId) {
+        updateProgressTrackerUI();
+    }
 
     try {
         const res = await fetch(API.run, {
@@ -204,7 +363,26 @@ async function runScript(relPath) {
                 runStatus.textContent = 'Locked';
                 runStatus.className = 'run-status error';
             }
+            if (state.runningScripts[termId]) {
+                state.runningScripts[termId].status = 'failed';
+                if (termId === state.activeTerminalId) updateProgressTrackerUI();
+                setTimeout(() => {
+                    if (state.runningScripts[termId] && state.runningScripts[termId].status === 'failed') {
+                        state.runningScripts[termId].status = 'idle';
+                        if (state.activeTerminalId === termId) updateProgressTrackerUI();
+                    }
+                }, 5000);
+            }
             return;
+        }
+
+        if (!res.ok) {
+            const data = await res.json().catch(() => ({}));
+            throw new Error(data.error || `Script run failed with HTTP ${res.status}`);
+        }
+
+        if (!res.body) {
+            throw new Error('Script run did not return a stream');
         }
 
         const reader = res.body.getReader();
@@ -226,13 +404,40 @@ async function runScript(relPath) {
                     try {
                         const data = JSON.parse(chunk.substring(6));
 
-                        if (data.type === 'stdout' || data.type === 'error' || data.type === 'system') {
+                        if (data.type === 'started') {
+                            runId = data.run_id;
+                            const running = state.runningScripts[termId];
+                            if (running) {
+                                running.run_id = runId;
+                                if (running.abortRequested) abortScriptRun(termId);
+                            }
+                            updateRunButton();
+                            appendToCli(data.content, 'system', termId);
+                        } else if (data.type === 'stdout' || data.type === 'error' || data.type === 'system') {
                             let cssClass = data.type === 'stdout' ? 'stdout' : (data.type === 'system' ? 'system' : 'stderr');
                             appendToCli(data.content, cssClass, termId);
-                            // Mirror stdout/stderr to debugger
                             if (typeof DebuggerConsole !== 'undefined') {
                                 const dbgType = data.type === 'error' ? 'error' : 'log';
                                 DebuggerConsole.addEntry(dbgType, data.content.trimEnd(), relPath);
+                            }
+            } else if (data.type === 'progress') {
+                state.runningScripts[termId] = {
+                    step: data.step,
+                    total: data.total,
+                    command: data.command,
+                    status: 'running'
+                };
+                if (termId === state.activeTerminalId) {
+                    updateProgressTrackerUI();
+                }
+            } else if (data.type === 'aborted') {
+                appendToCli(data.content, 'error', termId);
+                if (typeof DebuggerConsole !== 'undefined') {
+                    DebuggerConsole.addEntry('error', `Script aborted (ID: ${data.run_id})`, 'script');
+                }
+                if (termId === state.activeTerminalId) {
+                    runStatus.textContent = 'Aborted';
+                    runStatus.className = 'run-status error';
                             }
                         } else if (data.type === 'metrics') {
                             if (data.success) {
@@ -244,6 +449,19 @@ async function runScript(relPath) {
                                     runStatus.textContent = 'Success';
                                     runStatus.className = 'run-status success';
                                 }
+                                if (state.runningScripts[termId]) {
+                                    state.runningScripts[termId].status = 'success';
+                                    if (state.runningScripts[termId].total > 0) {
+                                        state.runningScripts[termId].step = state.runningScripts[termId].total;
+                                    }
+                                    if (termId === state.activeTerminalId) updateProgressTrackerUI();
+                                    setTimeout(() => {
+                                        if (state.runningScripts[termId] && state.runningScripts[termId].status === 'success') {
+                                            state.runningScripts[termId].status = 'idle';
+                                            if (state.activeTerminalId === termId) updateProgressTrackerUI();
+                                        }
+                                    }, 3000);
+                                }
                             } else {
                                 appendToCli(`Script failed (Exit code: ${data.exit_code})`, 'error', termId);
                                 if (typeof DebuggerConsole !== 'undefined') {
@@ -252,6 +470,16 @@ async function runScript(relPath) {
                                 if (termId === state.activeTerminalId) {
                                     runStatus.textContent = 'Failed';
                                     runStatus.className = 'run-status error';
+                                }
+                                if (state.runningScripts[termId]) {
+                                    state.runningScripts[termId].status = 'failed';
+                                    if (termId === state.activeTerminalId) updateProgressTrackerUI();
+                                    setTimeout(() => {
+                                        if (state.runningScripts[termId] && state.runningScripts[termId].status === 'failed') {
+                                            state.runningScripts[termId].status = 'idle';
+                                            if (state.activeTerminalId === termId) updateProgressTrackerUI();
+                                        }
+                                    }, 5000);
                                 }
                             }
 
@@ -267,18 +495,29 @@ async function runScript(relPath) {
             }
         }
     } catch (err) {
-        appendToCli(`Error executing script: ${err.message}`, 'stderr', termId);
-        if (typeof DebuggerConsole !== 'undefined') DebuggerConsole.addEntry('error', `Script error: ${err.message}`, 'script');
-        if (termId === state.activeTerminalId) {
-            runStatus.textContent = 'Error';
-            runStatus.className = 'run-status error';
+        const abortRequested = Boolean(state.runningScripts[termId]?.abortRequested);
+        if (!abortRequested) {
+            appendToCli(`Error executing script: ${err.message}`, 'stderr', termId);
+            if (typeof DebuggerConsole !== 'undefined') DebuggerConsole.addEntry('error', `Script error: ${err.message}`, 'script');
+            if (termId === state.activeTerminalId) {
+                runStatus.textContent = 'Error';
+                runStatus.className = 'run-status error';
+            }
+        }
+        if (state.runningScripts[termId]) {
+            state.runningScripts[termId].status = 'failed';
+            if (termId === state.activeTerminalId) updateProgressTrackerUI();
+            setTimeout(() => {
+                if (state.runningScripts[termId] && state.runningScripts[termId].status === 'failed') {
+                    state.runningScripts[termId].status = 'idle';
+                    if (state.activeTerminalId === termId) updateProgressTrackerUI();
+                }
+            }, 5000);
         }
     } finally {
         refreshExecutionHistoryIfVisible();
-        if (btnRun) {
-            btnRun.classList.remove('running');
-            btnRun.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg><span>Run</span>`;
-        }
+        delete state.runningScripts[termId];
+        updateRunButton();
     }
 }
 
@@ -403,6 +642,12 @@ function renderHistoryEntries(entries = []) {
                         ${duration ? `<span>${escapeHtml(duration)}</span>` : ''}
                         ${entry.exit_code !== null && entry.exit_code !== undefined ? `<span>Exit ${escapeHtml(String(entry.exit_code))}</span>` : ''}
                         <button class="btn btn-action history-log-link" data-log-file="${escapeAttr(entry.log_file || '')}">Open log</button>
+                        <button
+                            class="history-replay-btn"
+                            onclick="openReplay('${entry.id}')"
+                            aria-label="Replay execution session">
+                            ▶ Replay
+                        </button>
                     </div>
                 </div>
                 <div class="history-entry-command">${escapeHtml(entry.command || entry.display_name || '')}</div>
@@ -480,20 +725,35 @@ async function exportExecutionHistory(format = 'log') {
 }
 
 async function saveScript(category, filename, content) {
+    const btn = document.getElementById('modal-save');
+
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Saving...';
+    }
     try {
-        const relPath = `${category}/${filename}`.replace(/\/+/g, '/'); // simple guess
+        const relPath = `${category}/${filename}`.replace(/\/+/g, '/');
+
         const res = await fetch(API.save, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ category, filename, content, password: state.unlockedScripts[relPath] || '' }),
+            body: JSON.stringify({
+                category,
+                filename,
+                content,
+                password: state.unlockedScripts[relPath] || ''
+            }),
         });
         const data = await res.json();
 
         if (res.status === 401) {
             notify('Cannot save: Script is locked.', 'warning');
+            if (btn) {
+                btn.disabled = false;
+                btn.textContent = 'Save';
+            }
             return;
         }
-
         if (data.success) {
             await loadScripts();
             closeModal();
@@ -503,6 +763,11 @@ async function saveScript(category, filename, content) {
     } catch (err) {
         console.error('Failed to save script:', err);
         notify(`Failed to save script: ${err.message}`, 'error');
+    } finally {
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = 'Save';
+        }
     }
 }
 
@@ -557,31 +822,66 @@ async function toggleFavorite(relPath) {
 }
 
 async function importGithubScript(url, category, filename) {
+    const btn = document.getElementById('github-modal-import');
+
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Importing...';
+    }
     try {
         const res = await fetch(API.import_github, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ url, category, filename }),
+            body: JSON.stringify({
+                url,
+                category,
+                filename
+            }),
         });
         const data = await res.json();
 
         if (res.status === 401) {
-            notify('File already exists and is locked.', 'warning');
+            notify(
+                'File already exists and is locked.',
+                'warning'
+            );
+
             return;
         }
 
         if (data.success) {
             await loadScripts();
-            document.getElementById('github-modal-overlay').classList.remove('active');
+            document
+                .getElementById('github-modal-overlay')
+                .classList.remove('active');
+
             selectScript(data.path);
-            appendToCli(`✓ Imported script from GitHub: ${data.path}`, 'success');
-            notify('Script imported successfully.', 'success');
+            appendToCli(
+                `✓ Imported script from GitHub: ${data.path}`,
+                'success'
+            );
+            notify(
+                'Script imported successfully.',
+                'success'
+            );
         } else {
-            notify(`Import failed: ${data.error}`, 'error');
+            notify(
+                `Import failed: ${data.error}`,
+                'error'
+            );
         }
     } catch (err) {
         console.error('Import error:', err);
-        notify(`Exception during import: ${err.message}`, 'error');
+
+        notify(
+            `Exception during import: ${err.message}`,
+            'error'
+        );
+    } finally {
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = 'Import';
+        }
     }
 }
 
@@ -604,49 +904,138 @@ function raisePRFlow(relPath) {
 
 // 2. Executes the API call to the backend after the modal is submitted
 async function executePR(relPath, branch, message, repoUrl) {
-    // Hide the modal immediately
-    document.getElementById('pr-modal-overlay').classList.remove('active');
+    const btn = document.getElementById('pr-modal-submit');
+    const btnCancel = document.getElementById('pr-modal-cancel');
+    const btnClose = document.getElementById('pr-modal-close');
+    const inputRepo = document.getElementById('pr-repo');
+    const inputBranch = document.getElementById('pr-branch');
+    const inputMsg = document.getElementById('pr-message');
 
-    // Automatically toggle the Debugger Console to show progress logs to the user
+    const setControlsDisabled = (disabled) => {
+        if (btn) {
+            btn.disabled = disabled;
+            btn.textContent = disabled ? 'Pushing...' : 'Push / PR';
+        }
+        if (btnCancel) btnCancel.disabled = disabled;
+        if (btnClose) btnClose.disabled = disabled;
+        if (inputRepo) inputRepo.disabled = disabled;
+        if (inputBranch) inputBranch.disabled = disabled;
+        if (inputMsg) inputMsg.disabled = disabled;
+    };
+
+    setControlsDisabled(true);
+
+    // Show debugger logs
     if (typeof DebuggerConsole !== 'undefined') {
         DebuggerConsole.toggle();
-        DebuggerConsole.addEntry('info', `🚀 Starting Git PR workflow for: ${relPath}`, 'git');
-        if (repoUrl) DebuggerConsole.addEntry('info', `   Target Repo: ${repoUrl}`, 'git');
-        DebuggerConsole.addEntry('info', `   Branch: ${branch}`, 'git');
-        DebuggerConsole.addEntry('info', `   Message: ${message}`, 'git');
-        DebuggerConsole.addEntry('info', `Running git operations in backend...`, 'git');
+
+        DebuggerConsole.addEntry(
+            'info',
+            `🚀 Starting Git PR workflow for: ${relPath}`,
+            'git'
+        );
+        if (repoUrl) {
+            DebuggerConsole.addEntry(
+                'info',
+                `   Target Repo: ${repoUrl}`,
+                'git'
+            );
+        }
+        DebuggerConsole.addEntry(
+            'info',
+            `   Branch: ${branch}`,
+            'git'
+        );
+        DebuggerConsole.addEntry(
+            'info',
+            `   Message: ${message}`,
+            'git'
+        );
+        DebuggerConsole.addEntry(
+            'info',
+            `Running git operations in backend...`,
+            'git'
+        );
     }
 
     try {
-        // Call the backend API with the branch, message, and the optional target repo
         const res = await fetch(API.pr, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ path: relPath, branch, message, target_repo: repoUrl }),
+
+            body: JSON.stringify({
+                path: relPath,
+                branch,
+                message,
+                target_repo: repoUrl
+            }),
         });
         const data = await res.json();
 
         if (data.success) {
             if (typeof DebuggerConsole !== 'undefined') {
-                DebuggerConsole.addEntry('log', `✨ Git operation successful!`, 'git');
-                DebuggerConsole.addEntry('log', `🔗 PR Link: ${data.pr_url}`, 'git');
+                DebuggerConsole.addEntry(
+                    'log',
+                    `✨ Git operation successful!`,
+                    'git'
+                );
+                DebuggerConsole.addEntry(
+                    'log',
+                    `🔗 PR Link: ${data.pr_url}`,
+                    'git'
+                );
             }
-            appendToCli(`✓ Git PR branch '${data.branch}' created and pushed.`, 'success');
+            appendToCli(
+                `✓ Git PR branch '${data.branch}' created and pushed.`,
+                'success'
+            );
+            notify(
+                'PR workflow completed successfully.',
+                'success'
+            );
+            
+            // Hide modal on success
+            document
+                .getElementById('pr-modal-overlay')
+                .classList.remove('active');
 
-            // Offer to automatically open the GitHub Pull Request page
-            if (confirm(`Successfully pushed to branch '${data.branch}'.\n\nWould you like to open the Pull Request page on GitHub?`)) {
+            // Offer PR page opening
+            if (
+                confirm(
+                    `Successfully pushed to branch '${data.branch}'.\n\nWould you like to open the Pull Request page on GitHub?`
+                )
+            ) {
                 window.open(data.pr_url, '_blank');
             }
         } else {
-            if (typeof DebuggerConsole !== 'undefined') DebuggerConsole.addEntry('error', `❌ Git PR failed: ${data.error}`, 'git');
-            notify(`PR workflow failed: ${data.error}`, 'error');
+            if (typeof DebuggerConsole !== 'undefined') {
+                DebuggerConsole.addEntry(
+                    'error',
+                    `❌ Git PR failed: ${data.error}`,
+                    'git'
+                );
+            }
+            notify(
+                `PR workflow failed: ${data.error}`,
+                'error'
+            );
         }
     } catch (err) {
-        if (typeof DebuggerConsole !== 'undefined') DebuggerConsole.addEntry('error', `❌ Git PR Exception: ${err.message}`, 'git');
-        notify(`Exception during PR workflow: ${err.message}`, 'error');
+        if (typeof DebuggerConsole !== 'undefined') {
+            DebuggerConsole.addEntry(
+                'error',
+                `❌ Git PR Exception: ${err.message}`,
+                'git'
+            );
+        }
+        notify(
+            `Exception during PR workflow: ${err.message}`,
+            'error'
+        );
+    } finally {
+        setControlsDisabled(false);
     }
 }
-
 async function manageLock(relPath, oldPass, newPass) {
     try {
         const res = await fetch(API.lock, {
@@ -675,11 +1064,169 @@ async function manageLock(relPath, oldPass, newPass) {
     }
 }
 
+/* ─── Replay Engine ───────────────────────── */
+
+async function openReplay(sessionId) {
+    try {
+        const res = await fetch(`/api/history/session/${sessionId}`);
+        const data = await res.json();
+
+        if (!res.ok) {
+            notify(data.error || 'Failed to load replay session.', 'error');
+            return;
+        }
+
+        state.replay.events = data.events || [];
+        state.replay.index = 0;
+        state.replay.playing = true;
+
+        const overlay = document.getElementById('replay-modal-overlay');
+        const terminal = document.getElementById('replay-terminal');
+        const metadata = document.getElementById('replay-metadata');
+
+        terminal.innerHTML = '';
+
+        metadata.innerHTML = `
+            <strong>${escapeHtml(data.metadata.display_name)}</strong>
+            · ${escapeHtml(data.metadata.status)}
+            · Exit ${data.metadata.exit_code}
+            · ${data.metadata.duration_seconds}s
+        `;
+
+        overlay.classList.add('active');
+
+        playReplay();
+        persistWorkspace();
+    } catch (err) {
+        console.error(err);
+
+        notify(
+            `Replay failed: ${err.message}`,
+            'error'
+        );
+    }
+}
+
+function playReplay() {
+    clearTimeout(state.replay.timer);
+
+    if (!state.replay.playing) {
+        return;
+    }
+
+    const terminal = document.getElementById('replay-terminal');
+
+    if (state.replay.index >= state.replay.events.length) {
+        return;
+    }
+
+    const event = state.replay.events[state.replay.index];
+
+    const line = document.createElement('div');
+
+    line.className = `replay-line ${event.stream}`;
+
+    line.textContent = event.content;
+
+    terminal.appendChild(line);
+
+    terminal.scrollTop = terminal.scrollHeight;
+
+    state.replay.index++;
+
+    const nextEvent = state.replay.events[state.replay.index];
+
+    let delay = 50;
+
+    if (nextEvent) {
+        delay = Math.max(
+            10,
+            (nextEvent.timestamp - event.timestamp) * 1000
+        );
+    }
+
+    delay /= state.replay.speed;
+
+    state.replay.timer = setTimeout(
+        playReplay,
+        delay
+    );
+}
+
+function toggleReplayPlayback() {
+    state.replay.playing = !state.replay.playing;
+
+    document.getElementById('replay-play-pause').textContent =
+        state.replay.playing
+            ? 'Pause'
+            : 'Play';
+
+    if (state.replay.playing) {
+        playReplay();
+    }
+}
+
+function restartReplay() {
+    clearTimeout(state.replay.timer);
+    state.replay.index = 0;
+    state.replay.playing = true;
+    document.getElementById('replay-terminal').innerHTML = '';
+    document.getElementById('replay-play-pause').textContent = 'Pause';
+    playReplay();
+}
+
+function closeReplay() {
+    clearTimeout(state.replay.timer);
+
+    document
+        .getElementById('replay-modal-overlay')
+        .classList.remove('active');
+}
+
+function updateProgressTrackerUI() {
+    const panel = document.getElementById('progress-tracker-panel');
+    if (!panel) return;
+
+    const termId = state.activeTerminalId;
+    const progress = state.runningScripts[termId];
+
+    if (!progress || progress.status === 'idle') {
+        panel.style.display = 'none';
+        return;
+    }
+
+    panel.style.display = 'flex';
+
+    const stepEl = document.getElementById('progress-tracker-step');
+    const fillEl = document.getElementById('progress-bar-fill');
+    const cmdEl = document.getElementById('progress-tracker-command');
+    const statusEl = document.getElementById('progress-tracker-status');
+
+    stepEl.textContent = `Step ${progress.step}/${progress.total}`;
+    
+    const pct = progress.total > 0 ? (progress.step / progress.total) * 100 : 0;
+    fillEl.style.width = `${pct}%`;
+    
+    cmdEl.textContent = progress.command || 'Running...';
+    cmdEl.title = progress.command || '';
+    
+    // Status text & class
+    let statusText = 'Idle';
+    if (progress.status === 'running') {
+        statusText = '🔄 Running';
+    } else if (progress.status === 'success') {
+        statusText = '✅ Success';
+    } else if (progress.status === 'failed') {
+        statusText = '❌ Failed';
+    }
+    statusEl.textContent = `Status: ${statusText}`;
+    statusEl.className = `progress-tracker-status ${progress.status}`;
+}
 
 // ─── CLI Helpers ───
 
 function appendToCli(text, className = '', termId = state.activeTerminalId) {
-    const termBody = document.getElementById(`terminal-body-${termId}`) || document.getElementById('terminal-body');
+    const termBody = getTerminalBody(termId);
     if (!termBody) return;
 
     const welcomeEl = termBody.querySelector('.cli-welcome');
@@ -696,16 +1243,226 @@ function appendToCli(text, className = '', termId = state.activeTerminalId) {
     }
 
     highlightTerminalSearch();
+    persistWorkspace();
 }
 
 function clearCli() {
-    const termBody = document.getElementById(`terminal-body-${state.activeTerminalId}`) || document.getElementById('terminal-body');
+    const termBody = getTerminalBody(state.activeTerminalId);
     if (termBody) {
         termBody.innerHTML = '<div class="cli-welcome"><span class="cli-prompt">$</span> <span class="cli-welcome-text">Terminal cleared.</span></div>';
     }
     document.getElementById('run-status').textContent = '';
     document.getElementById('run-status').className = 'run-status';
     document.getElementById('resource-panel').style.display = 'none';
+
+    if (state.runningScripts && state.runningScripts[state.activeTerminalId] && state.runningScripts[state.activeTerminalId].status !== 'running') {
+        state.runningScripts[state.activeTerminalId].status = 'idle';
+        updateProgressTrackerUI();
+    }
+}
+
+
+// ─── Session Persistence ──────────────────────────────────
+
+async function saveSession() {
+    const sessionData = {
+        sessionId: state.sessionId || generateUUID(),
+        timestamp: Date.now(),
+
+        terminals: state.terminals.map(id => {
+            const body =
+                document.getElementById(`terminal-body-${id}`) ||
+                (id === 1
+                    ? document.getElementById('terminal-body')
+                    : null);
+
+            if (!body) return null;
+
+            const lines = Array.from(
+                body.querySelectorAll('.cli-output-block')
+            )
+                .slice(-100)
+                .map(el => ({
+                    text: el.textContent,
+                    className: el.className.replace(
+                        'cli-output-block ',
+                        ''
+                    )
+                }));
+
+            return {
+                id,
+                lines
+            };
+        }).filter(t => t !== null),
+
+        activeTerminalId: state.activeTerminalId,
+        nextTerminalId: state.nextTerminalId,
+
+        cmdHistory: state.cmdHistory,
+        cmdHistoryIndex: state.cmdHistoryIndex,
+
+        unlockedScripts: state.unlockedScripts
+    };
+
+    try {
+        await fetch('/api/sessions/save', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                session: sessionData
+            })
+        });
+
+        state.sessionId = sessionData.sessionId;
+        state.lastSaveTimestamp = Date.now();
+
+    } catch (e) {
+        console.error('Failed to save session:', e);
+    }
+}
+
+
+function generateUUID() {
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'
+        .replace(/[xy]/g, c => {
+            const r = Math.random() * 16 | 0;
+            const v = c === 'x'
+                ? r
+                : (r & 0x3 | 0x8);
+
+            return v.toString(16);
+        });
+}
+
+
+let saveSessionTimeout = null;
+
+function saveSessionDebounced() {
+    if (saveSessionTimeout) {
+        clearTimeout(saveSessionTimeout);
+    }
+
+    saveSessionTimeout = setTimeout(() => {
+        saveSession();
+    }, 2000);
+}
+
+
+async function restoreSession() {
+    try {
+        const res = await fetch('/api/sessions/restore');
+        const data = await res.json();
+
+        if (!data.success || !data.session) {
+            return;
+        }
+
+        const session = data.session;
+
+        state.sessionId = session.sessionId || null;
+
+        const terminalIds = session.terminals?.map(t => t.id);
+        state.terminals = terminalIds?.length ? terminalIds : [1];
+
+        state.activeTerminalId =
+            session.activeTerminalId || 1;
+
+        state.nextTerminalId =
+            Math.max(...state.terminals) + 1;
+
+        state.cmdHistory =
+            session.cmdHistory || [];
+
+        state.cmdHistoryIndex =
+            session.cmdHistoryIndex || -1;
+
+        state.unlockedScripts =
+            session.unlockedScripts || {};
+
+        const existingTabs =
+            document.querySelectorAll('.cli-tab');
+
+        existingTabs.forEach(tab => {
+            if (tab.id !== 'tab-btn-1') {
+                tab.remove();
+            }
+        });
+
+        const existingBodies =
+            document.querySelectorAll('.cli-body');
+
+        existingBodies.forEach(body => {
+            if (body.id !== 'terminal-body') {
+                body.remove();
+            }
+        });
+
+        for (const term of session.terminals || []) {
+
+            if (term.id !== 1) {
+                // Create terminal DOM directly with the saved ID
+                // instead of calling addTerminal() which would
+                // corrupt state.nextTerminalId and state.terminals
+                const tabsContainer = document.getElementById('cli-tabs');
+                const tabBtn = document.createElement('div');
+                tabBtn.className = 'cli-tab';
+                tabBtn.id = `tab-btn-${term.id}`;
+                tabBtn.innerHTML = `
+                    <span class="cli-dots" style="margin-right: 6px;">
+                        <span class="dot dot-red"></span>
+                        <span class="dot dot-yellow"></span>
+                        <span class="dot dot-green"></span>
+                    </span>
+                    <span>Terminal ${term.id}</span>
+                    <button class="cli-tab-close" title="Close" aria-label="Close terminal" onclick="event.stopPropagation(); closeTerminal(${term.id})"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg></button>`;
+                tabBtn.onclick = () => switchTerminal(term.id);
+                tabsContainer.insertBefore(tabBtn, document.getElementById('btn-add-tab'));
+
+                const bodyContainer = document.createElement('div');
+                bodyContainer.className = 'cli-body';
+                bodyContainer.setAttribute('role', 'log');
+                bodyContainer.setAttribute('aria-live', 'polite');
+                bodyContainer.id = `terminal-body-${term.id}`;
+                bodyContainer.style.display = 'none';
+
+                document.getElementById('cli-area').insertBefore(
+                    bodyContainer,
+                    document.querySelector('.cli-input-bar')
+                );
+            }
+
+            const body =
+                document.getElementById(`terminal-body-${term.id}`) ||
+                (term.id === 1
+                    ? document.getElementById('terminal-body')
+                    : null);
+
+            if (!body) continue;
+
+            body.innerHTML = '';
+
+            for (const line of term.lines || []) {
+                const div = document.createElement('div');
+
+                div.className =
+                    `cli-output-block ${line.className}`;
+
+                div.textContent = line.text;
+
+                body.appendChild(div);
+            }
+        }
+
+        switchTerminal(state.activeTerminalId);
+
+        console.log('Session restored successfully');
+
+    } catch (e) {
+        console.error('Failed to restore session:', e);
+    }
 }
 
 // ─── Terminal Utility Actions ───────────────────────────────
@@ -840,6 +1597,8 @@ function addTerminal() {
 
     document.getElementById('cli-area').insertBefore(bodyContainer, document.querySelector('.cli-input-bar'));
     switchTerminal(id);
+    persistWorkspace();
+    saveSessionDebounced();
 }
 
 function switchTerminal(id) {
@@ -850,13 +1609,29 @@ function switchTerminal(id) {
     if (activeTab) activeTab.classList.add('active');
 
     document.querySelectorAll('.cli-body').forEach(b => b.style.display = 'none');
-    const activeBody = document.getElementById(`terminal-body-${id}`) || (id === 1 ? document.getElementById('terminal-body') : null);
+    const activeBody = getTerminalBody(id);
     if (activeBody) activeBody.style.display = 'block';
 
     // Sync auto-scroll button to the newly active terminal's state
     updateAutoScrollBtn(id, state.autoScroll[id] !== false);
 
+    const runStatus = document.getElementById('run-status');
+    const resourcePanel = document.getElementById('resource-panel');
+    const running = state.runningScripts[id];
+    if (running) {
+        runStatus.textContent = running.aborting ? 'Aborting...' : 'Executing...';
+        runStatus.className = 'run-status running';
+        resourcePanel.style.display = 'none';
+    } else {
+        runStatus.textContent = '';
+        runStatus.className = 'run-status';
+    }
+    updateRunButton();
     highlightTerminalSearch();
+
+    updateProgressTrackerUI();
+    persistWorkspace();
+
 }
 
 function closeTerminal(id) {
@@ -868,12 +1643,20 @@ function closeTerminal(id) {
     const tabBtn = document.getElementById(`tab-btn-${id}`) || document.querySelector(`.cli-tab[data-id="${id}"]`);
     if (tabBtn) tabBtn.remove();
 
-    const bodyContainer = document.getElementById(`terminal-body-${id}`) || (id === 1 ? document.getElementById('terminal-body') : null);
+    const bodyContainer = getTerminalBody(id);
     if (bodyContainer) bodyContainer.remove();
+
+    if (state.runningScripts && state.runningScripts[id]) {
+        delete state.runningScripts[id];
+    }
 
     if (state.activeTerminalId === id) {
         switchTerminal(state.terminals[state.terminals.length - 1]);
+    } else {
+        updateProgressTrackerUI();
     }
+    persistWorkspace();
+    saveSessionDebounced();
 }
 
 // ─── Terminal Search Highlight ───
@@ -1122,6 +1905,7 @@ async function selectScript(relPath) {
     // Toolbar states
     const btnFav = document.getElementById('btn-fav');
     if (btnFav) btnFav.classList.toggle('active', script.favorite);
+    updateRunButton();
 
     const btnLock = document.getElementById('btn-lock');
     if (btnLock) {
@@ -1146,6 +1930,8 @@ async function selectScript(relPath) {
     // Animate in
     detailPanel.classList.add('animate-in');
     setTimeout(() => detailPanel.classList.remove('animate-in'), 300);
+
+    persistWorkspace();
 }
 
 function showWelcome() {
@@ -1237,6 +2023,38 @@ function bindEvents() {
     if (cliSearchInput) {
         cliSearchInput.addEventListener('input', () => highlightTerminalSearch());
     }
+    // Real-Time Sidebar Script Filter Logic (Fixed Variant)
+    const scriptSearchBar = document.getElementById('script-search-bar');
+    if (scriptSearchBar) {
+        scriptSearchBar.addEventListener('input', (e) => {
+            const filterText = e.target.value.toLowerCase().trim();
+            const scriptItems = document.querySelectorAll('#category-tree .script-item');
+            
+            scriptItems.forEach(item => {
+                const scriptNameEl = item.querySelector('.script-item-name');
+                if (!scriptNameEl) return;
+                
+                const scriptName = scriptNameEl.textContent.toLowerCase();
+                
+                if (scriptName.includes(filterText)) {
+                    item.style.display = 'flex';
+                } else {
+                    item.style.display = 'none';
+                }
+            });
+
+            // Handle category auto-expansion smoothly without resetting terminal CSS
+            const categoryLists = document.querySelectorAll('#category-tree .script-list');
+            categoryLists.forEach(list => {
+                if (filterText !== '') {
+                    list.style.maxHeight = 'none';
+                    list.classList.remove('collapsed');
+                } else {
+                    list.style.maxHeight = '';
+                }
+            });
+        });
+    }
 
     // Terminal Tabs
     const btnAddTab = document.getElementById('btn-add-tab');
@@ -1302,6 +2120,10 @@ function bindEvents() {
         }
     });
 
+    cliInput.addEventListener('input', () => {
+        persistWorkspace();
+    });
+
     // Run Command button
     document.getElementById('btn-run-cmd').addEventListener('click', () => {
         const cmd = cliInput.value.trim();
@@ -1337,7 +2159,15 @@ function bindEvents() {
 
     // Script Details Actions
     const btnRun = document.getElementById('btn-run');
-    if (btnRun) btnRun.addEventListener('click', () => { if (state.activeScript) runScript(state.activeScript); });
+    if (btnRun) {
+        btnRun.addEventListener('click', () => {
+            if (state.runningScripts[state.activeTerminalId]) {
+                abortScriptRun(state.activeTerminalId);
+            } else if (state.activeScript) {
+                runScript(state.activeScript);
+            }
+        });
+    }
 
     const btnEdit = document.getElementById('btn-edit');
     if (btnEdit) btnEdit.addEventListener('click', () => { if (state.activeScript) openModal('edit'); });
@@ -1381,6 +2211,39 @@ function bindEvents() {
     });
     if (historyExportTxt) historyExportTxt.addEventListener('click', () => exportExecutionHistory('txt'));
     if (historyExportLog) historyExportLog.addEventListener('click', () => exportExecutionHistory('log'));
+
+    const historyClearBtn = document.getElementById('history-clear-btn');
+    if (historyClearBtn) {
+        historyClearBtn.addEventListener('click', async () => {
+            const confirmation = confirm('Are you sure you want to permanently clear your command history log?');
+            if (!confirmation) return;
+
+            try {
+                const response = await fetch('/api/command_history/clear', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                const result = await response.json();
+
+                if (result.success) {
+                    const targetDisplayList = document.getElementById('history-list');
+                    if (targetDisplayList) {
+                        targetDisplayList.innerHTML = '<div class="history-empty-state">Command history cleared successfully.</div>';
+                    }
+                    const targetSummaryWidget = document.getElementById('history-summary');
+                    if (targetSummaryWidget) {
+                        targetSummaryWidget.innerHTML = '';
+                    }
+                    notify('Command history cleared successfully!', 'success');
+                } else {
+                    notify('Server failed to clear history: ' + (result.error || 'Unknown error'), 'error');
+                }
+            } catch (err) {
+                console.error('Error clearing history:', err);
+                notify('An unexpected error occurred while communicating with the backend.', 'error');
+            }
+        });
+    }
 
     // Main Modal controls
     document.getElementById('modal-close').addEventListener('click', closeModal);
@@ -1438,7 +2301,11 @@ function bindEvents() {
     // PR Modal Features
     const prOverlay = document.getElementById('pr-modal-overlay');
     if (prOverlay) {
-        const closePr = () => prOverlay.classList.remove('active');
+        const closePr = () => {
+            const btn = document.getElementById('pr-modal-submit');
+            if (btn && btn.disabled) return; // Prevent closing while operation is in progress
+            prOverlay.classList.remove('active');
+        };
         document.getElementById('pr-modal-close').addEventListener('click', closePr);
         document.getElementById('pr-modal-cancel').addEventListener('click', closePr);
         prOverlay.addEventListener('click', (e) => { if (e.target.id === 'pr-modal-overlay') closePr(); });
@@ -1498,6 +2365,26 @@ function bindEvents() {
         document.getElementById('lock-modal-cancel').addEventListener('click', closeLock);
         lockOverlay.addEventListener('click', (e) => { if (e.target.id === 'lock-modal-overlay') closeLock(); });
 
+        /* ─── Replay Controls ───────────────────── */
+
+        document
+            .getElementById('replay-play-pause')
+            ?.addEventListener('click', toggleReplayPlayback);
+
+        document
+            .getElementById('replay-close')
+            ?.addEventListener('click', closeReplay);
+
+        document
+            .getElementById('replay-speed')
+            ?.addEventListener('change', (e) => {
+                state.replay.speed = parseFloat(e.target.value) || 1;
+            });
+
+        document
+            .getElementById('replay-restart')
+            ?.addEventListener('click', restartReplay);
+
         document.getElementById('lock-modal-save').addEventListener('click', async () => {
             let isLocked = false;
             for (let cat in state.scripts) {
@@ -1536,6 +2423,34 @@ function bindEvents() {
             }
         });
     }
+
+    document
+        .getElementById('btn-analytics')
+        ?.addEventListener('click', openAnalytics);
+
+    document
+        .getElementById('analytics-close')
+        ?.addEventListener('click', () => {
+            document
+                .getElementById('analytics-modal-overlay')
+                .classList.remove('active');
+        });
+
+    document
+        .getElementById('btn-workspaces')
+        ?.addEventListener('click', openWorkspaceManager);
+
+    document
+        .getElementById('workspace-manager-close')
+        ?.addEventListener('click', () => {
+            document
+                .getElementById('workspace-manager-overlay')
+                ?.classList.remove('active');
+        });
+
+    document
+        .getElementById('workspace-save-profile')
+        ?.addEventListener('click', saveWorkspaceProfile);
 }
 
 // ─── Helpers ───────────────────────────────────────────────
@@ -1629,6 +2544,375 @@ function notify(message, type = 'info') {
 // ═══════════════════════════════════════════════════════════
 //  Debugger Console with Smart Suggestions
 // ═══════════════════════════════════════════════════════════
+
+// ─── Workspace Persistence ─────────────────────────────────
+
+function serializeWorkspace() {
+    const terminalSnapshots = state.terminals.map(id => {
+        const terminalBody = document.getElementById(`terminal-body-${id}`);
+        return {
+            id,
+            content: terminalBody?.innerHTML || '',
+            pendingInput: document.getElementById('cli-input')?.value || ''
+        };
+    });
+
+    return {
+        terminals: state.terminals,
+        terminalSnapshots,
+        activeTerminalId: state.activeTerminalId,
+        activeScript: state.activeScript,
+        searchQuery: state.searchQuery,
+        debuggerVisible:
+            typeof DebuggerConsole !== 'undefined'
+                ? DebuggerConsole.visible
+                : false,
+        replayState: {
+            active: !!state.replay?.sessionId
+        }
+    };
+}
+
+async function persistWorkspace() {
+    try {
+        await fetch('/api/workspace', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(serializeWorkspace())
+        });
+    } catch (err) {
+        console.error('Workspace persistence failed:', err);
+    }
+}
+
+async function checkWorkspaceRecovery() {
+    if (state.workspaceRestored) {
+        return;
+    }
+
+    try {
+        const res = await fetch('/api/workspace');
+        const data = await res.json();
+
+        if (data.workspace && data.workspace.corrupted) {
+            notify(
+                'Previous workspace snapshot was corrupted and has been isolated.',
+                'warning'
+            );
+            return;
+        }
+
+        if (!data.workspace || !data.workspace.workspace) {
+            return;
+        }
+
+        const snapshot = data.workspace.workspace;
+
+        const savedAt = data.workspace.saved_at;
+        const modalBody = document.querySelector('#workspace-restore-overlay .modal-body');
+        if (modalBody && savedAt) {
+            const existing = modalBody.querySelector('.workspace-snapshot-meta');
+            if (!existing) {
+                const meta = document.createElement('div');
+                meta.className = 'workspace-snapshot-meta';
+                meta.textContent = `Snapshot saved at: ${savedAt}`;
+                modalBody.appendChild(meta);
+            }
+        }
+
+        document
+            .getElementById('workspace-restore-overlay')
+            ?.classList.add('active');
+
+        document
+            .getElementById('workspace-restore-btn')
+            ?.addEventListener('click', () => {
+                restoreWorkspace(snapshot, 'full');
+            });
+
+        document
+            .getElementById('workspace-safe-btn')
+            ?.addEventListener('click', () => {
+                restoreWorkspace(snapshot, 'safe');
+            });
+
+        document
+            .getElementById('workspace-clean-btn')
+            ?.addEventListener('click', closeWorkspaceRestore);
+
+    } catch (err) {
+        console.error(err);
+    }
+}
+
+function closeWorkspaceRestore() {
+    document
+        .getElementById('workspace-restore-overlay')
+        ?.classList.remove('active');
+}
+
+function sanitizeWorkspaceSnapshot(data) {
+    const snapshot = structuredClone(data);
+
+    if (!Array.isArray(snapshot.terminals)) {
+        snapshot.terminals = [1];
+    }
+
+    if (
+        !snapshot.activeTerminalId ||
+        !snapshot.terminals.includes(snapshot.activeTerminalId)
+    ) {
+        snapshot.activeTerminalId = snapshot.terminals[0] || 1;
+    }
+
+    return snapshot;
+}
+
+function rebuildTerminalWorkspace(terminals, activeTerminalId, dataSnapshots = []) {
+    const tabsContainer = document.getElementById('cli-tabs');
+    const cliArea = document.getElementById('cli-area');
+
+    // Remove existing dynamic tabs (keep btn-add-tab)
+    document.querySelectorAll('.cli-tab').forEach(tab => {
+        if (!tab.id?.includes('btn-add-tab')) {
+            tab.remove();
+        }
+    });
+
+    // Remove existing terminal bodies (keep the original #terminal-body / cli-output)
+    document.querySelectorAll('.cli-body').forEach(body => {
+        if (body.id !== 'cli-output') {
+            body.remove();
+        }
+    });
+
+    // Reset state safely
+    state.terminals = [];
+
+    // Rebuild each terminal
+    terminals.forEach(id => {
+        const tabBtn = document.createElement('div');
+        tabBtn.className = 'cli-tab';
+        tabBtn.dataset.id = id;
+        tabBtn.id = `tab-btn-${id}`;
+        tabBtn.innerHTML = `
+            <span class="cli-tab-title">
+                <span class="dot dot-red"></span>
+                <span class="dot dot-yellow"></span>
+                <span class="dot dot-green"></span>
+                <span>Terminal ${id}</span>
+            </span>
+            <button class="cli-tab-close" title="Close" aria-label="Close terminal">×</button>
+        `;
+        tabBtn.onclick = () => switchTerminal(id);
+        tabBtn.querySelector('.cli-tab-close')?.addEventListener('click', (e) => {
+            e.stopPropagation();
+            closeTerminal(id);
+        });
+        tabsContainer.insertBefore(tabBtn, document.getElementById('btn-add-tab'));
+
+        const bodyContainer = document.createElement('div');
+        bodyContainer.className = 'cli-body';
+        bodyContainer.id = `terminal-body-${id}`;
+        bodyContainer.style.display = 'none';
+        bodyContainer.setAttribute('role', 'log');
+        bodyContainer.setAttribute('aria-live', 'polite');
+        const snapshot = dataSnapshots?.find(snap => snap.id === id);
+        bodyContainer.innerHTML = snapshot?.content ||
+            `<div class="cli-welcome">
+                <span class="cli-prompt">$</span>
+                <span class="cli-welcome-text">Restored terminal session.</span>
+            </div>`;
+        cliArea.insertBefore(bodyContainer, document.querySelector('.cli-input-bar'));
+
+        state.terminals.push(id);
+    });
+
+    // Restore pending input from first snapshot
+    const firstSnapshot = dataSnapshots?.[0];
+    if (firstSnapshot?.pendingInput) {
+        const cliInput = document.getElementById('cli-input');
+        if (cliInput) {
+            cliInput.value = firstSnapshot.pendingInput;
+        }
+    }
+
+    // Activate the correct terminal
+    switchTerminal(activeTerminalId);
+
+    // Advance nextTerminalId past all restored IDs
+    state.nextTerminalId = Math.max(...terminals, 1) + 1;
+}
+
+function restoreWorkspace(snapshot, mode = 'full') {
+    try {
+        const data =
+            mode === 'safe'
+                ? sanitizeWorkspaceSnapshot(snapshot)
+                : snapshot;
+
+        if (Array.isArray(data.terminals)) {
+            rebuildTerminalWorkspace(
+                data.terminals,
+                data.activeTerminalId || 1,
+                data.terminalSnapshots || []
+            );
+        }
+
+        if (data.activeTerminalId) {
+            state.activeTerminalId = data.activeTerminalId;
+        }
+
+        if (mode !== 'safe' && data.activeScript) {
+            selectScript(data.activeScript);
+        }
+
+        if (data.replayState?.active) {
+            notify('Replay session context detected.', 'info');
+        }
+
+        if (
+            data.debuggerVisible &&
+            typeof DebuggerConsole !== 'undefined'
+        ) {
+            DebuggerConsole.show();
+        }
+
+        state.workspaceRestored = true;
+
+        closeWorkspaceRestore();
+
+        notify(`Workspace restored (${mode} mode).`, 'success');
+
+    } catch (err) {
+        console.error(err);
+        notify('Workspace recovery failed.', 'error');
+    }
+}
+
+// ─── Workspace Manager ─────────────────────────────────────
+
+async function openWorkspaceManager() {
+    try {
+        const res = await fetch('/api/workspace/profiles');
+        const data = await res.json();
+
+        const container = document.getElementById('workspace-profile-list');
+
+        if (!data.profiles.length) {
+            container.innerHTML = '<p style="color:var(--text-secondary);margin:0;">No saved profiles yet.</p>';
+        } else {
+            container.innerHTML = data.profiles.map(profile => `
+                <div class="workspace-profile-item">
+                    <span>${escapeHtml(profile)}</span>
+                    <div class="workspace-profile-actions">
+                        <button class="btn" onclick="loadWorkspaceProfile('${escapeHtml(profile)}')">Load</button>
+                        <button class="btn" onclick="deleteWorkspaceProfile('${escapeHtml(profile)}')">Delete</button>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        document
+            .getElementById('workspace-manager-overlay')
+            .classList.add('active');
+
+    } catch (err) {
+        console.error(err);
+        notify('Failed to load workspace profiles.', 'error');
+    }
+}
+
+async function saveWorkspaceProfile() {
+    const input = document.getElementById('workspace-profile-name');
+    const name = input.value.trim();
+
+    if (!name) {
+        notify('Profile name required.', 'warning');
+        return;
+    }
+
+    try {
+        const res = await fetch('/api/workspace/profile', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, workspace: serializeWorkspace() })
+        });
+
+        const data = await res.json();
+
+        if (!data.success) {
+            notify(data.error, 'error');
+            return;
+        }
+
+        input.value = '';
+        notify('Workspace profile saved.', 'success');
+        openWorkspaceManager();
+
+    } catch (err) {
+        console.error(err);
+        notify('Failed to save workspace profile.', 'error');
+    }
+}
+
+async function loadWorkspaceProfile(name) {
+    try {
+        const res = await fetch(`/api/workspace/profile/${encodeURIComponent(name)}`);
+        const data = await res.json();
+
+        if (!data.success) {
+            notify(data.error, 'error');
+            return;
+        }
+
+        const profile = data.profile;
+
+        if (!profile.workspace) {
+            notify('Invalid workspace profile.', 'error');
+            return;
+        }
+
+        restoreWorkspace(profile.workspace, 'full');
+
+        document
+            .getElementById('workspace-manager-overlay')
+            ?.classList.remove('active');
+
+        notify(`Workspace profile "${name}" loaded.`, 'success');
+
+    } catch (err) {
+        console.error(err);
+        notify('Failed to load workspace profile.', 'error');
+    }
+}
+
+async function deleteWorkspaceProfile(name) {
+    const confirmed = confirm(`Delete workspace profile "${name}"?`);
+    if (!confirmed) {
+        return;
+    }
+
+    try {
+        const res = await fetch(`/api/workspace/profile/${encodeURIComponent(name)}`, {
+            method: 'DELETE'
+        });
+
+        const data = await res.json();
+
+        if (!data.success) {
+            notify(data.error, 'error');
+            return;
+        }
+
+        notify('Workspace profile deleted.', 'success');
+        openWorkspaceManager();
+
+    } catch (err) {
+        console.error(err);
+        notify('Failed to delete workspace profile.', 'error');
+    }
+}
 
 const DebuggerConsole = (() => {
     let entries = [];
@@ -1757,6 +3041,7 @@ const DebuggerConsole = (() => {
             const h = panel.offsetHeight;
             document.documentElement.style.setProperty('--debugger-height', h + 'px');
         }
+        persistWorkspace();
     }
 
     function close() {
@@ -1947,6 +3232,39 @@ const DebuggerConsole = (() => {
         });
         document.addEventListener('mouseup', () => { if (resizing) { resizing = false; document.body.style.cursor = ''; } });
     }
+
+document.addEventListener('keydown', (e) => {
+    // Ctrl+K → Search
+    if (e.ctrlKey && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+
+        const search = document.getElementById('search-input');
+
+        if (search) {
+            search.focus();
+        }
+    }
+
+    // Escape → Close modals
+    if (e.key === 'Escape') {
+        document
+            .querySelectorAll('.modal-overlay.active')
+            .forEach(modal => {
+                modal.classList.remove('active');
+            });
+    }
+
+    // Ctrl+Enter → Run Script
+    if (e.ctrlKey && e.key === 'Enter') {
+        e.preventDefault();
+
+        const runBtn = document.getElementById('btn-run');
+
+        if (runBtn) {
+            runBtn.click();
+        }
+    }
+});
 
     function init() {
         interceptConsole();
