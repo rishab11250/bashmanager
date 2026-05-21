@@ -1713,7 +1713,34 @@ def _format_time(seconds):
 
 # ─── Main ─────────────────────────────────────────────────────────
 
+DEFAULT_PORT = 5000
+
+
+def _server_port() -> int:
+    raw = os.environ.get("DEVSHELL_PORT", "").strip()
+    if not raw:
+        return DEFAULT_PORT
+    try:
+        port = int(raw)
+    except ValueError:
+        raise SystemExit(
+            f"Invalid DEVSHELL_PORT: {raw!r} (must be integer 1-65535)"
+        )
+    if not (1 <= port <= 65535):
+        raise SystemExit(
+            f"Invalid DEVSHELL_PORT: {raw!r} (must be integer 1-65535)"
+        )
+    return port
+
+
 if __name__ == '__main__':
-    print("[*] DevShell starting on http://localhost:5000")
+    port = _server_port()
+    debug = os.environ.get("FLASK_DEBUG") == "1"
+    print(f"[*] DevShell starting on http://127.0.0.1:{port}")
     print(f"[*] Scripts directory: {SCRIPTS_DIR}")
-    app.run(debug=True, port=5000)
+    app.run(
+        debug=debug,
+        host="127.0.0.1",
+        port=port,
+        use_reloader=False,
+    )

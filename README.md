@@ -67,7 +67,27 @@ Alternatively, start the Python Flask server to host the web interface locally o
 ```bash
 python app.py
 ```
-*The server will run on port 5000. Navigate to `http://127.0.0.1:5000`.*
+
+By default the server listens on **port 5000** at `http://127.0.0.1:5000`. Set `DEVSHELL_PORT` to use another port (empty `DEVSHELL_PORT` is treated as unset):
+
+```bash
+DEVSHELL_PORT=5001 python app.py
+```
+
+### Port conflicts (macOS and Electron)
+
+On macOS, **AirPlay Receiver** often uses port 5000. In **Desktop Mode** (`npm start`), DevShell automatically picks the next free port on `127.0.0.1` (5000–5100) and passes it to Flask via `DEVSHELL_PORT`. If the backend cannot start or bind, you get an error dialog instead of a blank window.
+
+Override manually (both modes):
+
+```bash
+export DEVSHELL_PORT=8080
+npm start
+```
+
+Invalid values (e.g. `abc`, `99999`, `-1`) show a startup error in Electron or exit with a clear message when running `python app.py` directly.
+
+**Manual checks:** occupy port 5000 (`python -m http.server 5000`), then `npm start` — UI should load on 5001+; `DEVSHELL_PORT=5000 npm start` while 5000 is busy — startup error, not infinite loading.
 
 ### Building Distributables (Linux)
 To compile the Electron application into a standalone `.AppImage` distribution:
