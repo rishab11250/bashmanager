@@ -1,26 +1,4 @@
-import importlib
-import sys
-from pathlib import Path
-
-
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-
-def _load_app(tmp_path, monkeypatch):
-    monkeypatch.setenv("DEV_SHELL_DATA_DIR", str(tmp_path))
-    if "app" in sys.modules:
-        app_module = importlib.reload(sys.modules["app"])
-    else:
-        import app as app_module
-    app_module.app.config.update({"TESTING": True})
-    return app_module
-
-
-def test_list_scripts_returns_json(tmp_path, monkeypatch):
-    app_module = _load_app(tmp_path, monkeypatch)
-    client = app_module.app.test_client()
+def test_list_scripts_returns_json(client):
 
     response = client.get("/api/scripts")
 
@@ -39,9 +17,7 @@ def test_list_scripts_returns_json(tmp_path, monkeypatch):
             assert "locked" in script
 
 
-def test_workspace_get_returns_success(tmp_path, monkeypatch):
-    app_module = _load_app(tmp_path, monkeypatch)
-    client = app_module.app.test_client()
+def test_workspace_get_returns_success(client):
 
     response = client.get("/api/workspace")
 
