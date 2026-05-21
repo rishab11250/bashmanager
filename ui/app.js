@@ -1910,6 +1910,38 @@ function bindEvents() {
     if (cliSearchInput) {
         cliSearchInput.addEventListener('input', () => highlightTerminalSearch());
     }
+    // Real-Time Sidebar Script Filter Logic (Fixed Variant)
+    const scriptSearchBar = document.getElementById('script-search-bar');
+    if (scriptSearchBar) {
+        scriptSearchBar.addEventListener('input', (e) => {
+            const filterText = e.target.value.toLowerCase().trim();
+            const scriptItems = document.querySelectorAll('#category-tree .script-item');
+            
+            scriptItems.forEach(item => {
+                const scriptNameEl = item.querySelector('.script-item-name');
+                if (!scriptNameEl) return;
+                
+                const scriptName = scriptNameEl.textContent.toLowerCase();
+                
+                if (scriptName.includes(filterText)) {
+                    item.style.display = 'flex';
+                } else {
+                    item.style.display = 'none';
+                }
+            });
+
+            // Handle category auto-expansion smoothly without resetting terminal CSS
+            const categoryLists = document.querySelectorAll('#category-tree .script-list');
+            categoryLists.forEach(list => {
+                if (filterText !== '') {
+                    list.style.maxHeight = 'none';
+                    list.classList.remove('collapsed');
+                } else {
+                    list.style.maxHeight = '';
+                }
+            });
+        });
+    }
 
     // Terminal Tabs
     const btnAddTab = document.getElementById('btn-add-tab');
@@ -2048,6 +2080,39 @@ function bindEvents() {
     });
     if (historyExportTxt) historyExportTxt.addEventListener('click', () => exportExecutionHistory('txt'));
     if (historyExportLog) historyExportLog.addEventListener('click', () => exportExecutionHistory('log'));
+
+    const historyClearBtn = document.getElementById('history-clear-btn');
+    if (historyClearBtn) {
+        historyClearBtn.addEventListener('click', async () => {
+            const confirmation = confirm('Are you sure you want to permanently clear your command history log?');
+            if (!confirmation) return;
+
+            try {
+                const response = await fetch('/api/command_history/clear', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                const result = await response.json();
+
+                if (result.success) {
+                    const targetDisplayList = document.getElementById('history-list');
+                    if (targetDisplayList) {
+                        targetDisplayList.innerHTML = '<div class="history-empty-state">Command history cleared successfully.</div>';
+                    }
+                    const targetSummaryWidget = document.getElementById('history-summary');
+                    if (targetSummaryWidget) {
+                        targetSummaryWidget.innerHTML = '';
+                    }
+                    notify('Command history cleared successfully!', 'success');
+                } else {
+                    notify('Server failed to clear history: ' + (result.error || 'Unknown error'), 'error');
+                }
+            } catch (err) {
+                console.error('Error clearing history:', err);
+                notify('An unexpected error occurred while communicating with the backend.', 'error');
+            }
+        });
+    }
 
     // Main Modal controls
     document.getElementById('modal-close').addEventListener('click', closeModal);
