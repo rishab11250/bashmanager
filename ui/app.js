@@ -50,6 +50,7 @@ let state = {
     terminals: [1],      // list of terminal IDs
     activeTerminalId: 1,
     nextTerminalId: 2,
+    autoScroll: {},      // per-terminal auto-scroll toggle: { termId: bool }
     workspaceRestored: false,
     workspaceProfiles: [],
     restoreMode: 'full',
@@ -149,6 +150,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     bindEvents();
     initResizers();
     await restoreSession();
+
+    // Initialize auto-scroll as enabled for terminal 1
+    state.autoScroll[1] = true;
 
     // Replace the execute icon inside the CLI input bar to a more standard 'Enter' icon
     const runCmdBtn = document.getElementById('btn-run-cmd');
@@ -1233,6 +1237,332 @@ function appendToCli(text, className = '', termId = state.activeTerminalId) {
     line.textContent = text;
     termBody.appendChild(line);
 
+    // Only auto-scroll if enabled for this terminal (default: true)
+    if (state.autoScroll[termId] !== false) {
+        termBody.scrollTop = termBody.scrollHeight;
+    }
+
+    highlightTerminalSearch();
+    persistWorkspace();
+}
+
+function clearCli() {
+    const termBody = getTerminalBody(state.activeTerminalId);
+    if (termBody) {
+        termBody.innerHTML = '<div class="cli-welcome"><span class="cli-prompt">$</span> <span class="cli-welcome-text">Terminal cleared.</span></div>';
+    }
+    document.getElementById('run-status').textContent = '';
+    document.getElementById('run-status').className = 'run-status';
+    document.getElementById('resource-panel').style.display = 'none';
+
+    if (state.runningScripts && state.runningScripts[state.activeTerminalId] && state.runningScripts[state.activeTerminalId].status !== 'running') {
+        state.runningScripts[state.activeTerminalId].status = 'idle';
+        updateProgressTrackerUI();
+    }
+}
+
+
+// ─── Session Persistence ──────────────────────────────────
+
+async function saveSession() {
+    const sessionData = {
+        sessionId: state.sessionId || generateUUID(),
+        timestamp: Date.now(),
+
+        terminals: state.terminals.map(id => {
+            const body =
+                document.getElementById(`terminal-body-${id}`) ||
+                (id === 1
+                    ? document.getElementById('terminal-body')
+                    : null);
+
+            if (!body) return null;
+
+            const lines = Array.from(
+                body.querySelectorAll('.cli-output-block')
+            )
+                .slice(-100)
+                .map(el => ({
+                    text: el.textContent,
+                    className: el.className.replace(
+                        'cli-output-block ',
+                        ''
+                    )
+                }));
+
+            return {
+                id,
+                lines
+            };
+        }).filter(t => t !== null),
+
+        activeTerminalId: state.activeTerminalId,
+        nextTerminalId: state.nextTerminalId,
+
+        cmdHistory: state.cmdHistory,
+        cmdHistoryIndex: state.cmdHistoryIndex,
+
+        unlockedScripts: state.unlockedScripts
+    };
+
+    try {
+        await fetch('/api/sessions/save', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                session: sessionData
+            })
+        });
+
+        state.sessionId = sessionData.sessionId;
+        state.lastSaveTimestamp = Date.now();
+
+    } catch (e) {
+        console.error('Failed to save session:', e);
+    }
+}
+
+
+function generateUUID() {
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'
+        .replace(/[xy]/g, c => {
+            const r = Math.random() * 16 | 0;
+            const v = c === 'x'
+                ? r
+                : (r & 0x3 | 0x8);
+
+            return v.toString(16);
+        });
+}
+
+
+let saveSessionTimeout = null;
+
+function saveSessionDebounced() {
+    if (saveSessionTimeout) {
+        clearTimeout(saveSessionTimeout);
+    }
+
+    saveSessionTimeout = setTimeout(() => {
+        saveSession();
+    }, 2000);
+}
+
+
+async function restoreSession() {
+    try {
+        const res = await fetch('/api/sessions/restore');
+        const data = await res.json();
+
+        if (!data.success || !data.session) {
+            return;
+        }
+
+        const session = data.session;
+
+        state.sessionId = session.sessionId || null;
+
+        const terminalIds = session.terminals?.map(t => t.id);
+        state.terminals = terminalIds?.length ? terminalIds : [1];
+
+        state.activeTerminalId =
+            session.activeTerminalId || 1;
+
+        state.nextTerminalId =
+            Math.max(...state.terminals) + 1;
+
+        state.cmdHistory =
+            session.cmdHistory || [];
+
+        state.cmdHistoryIndex =
+            session.cmdHistoryIndex || -1;
+
+        state.unlockedScripts =
+            session.unlockedScripts || {};
+
+        const existingTabs =
+            document.querySelectorAll('.cli-tab');
+
+        existingTabs.forEach(tab => {
+            if (tab.id !== 'tab-btn-1') {
+                tab.remove();
+            }
+        });
+
+        const existingBodies =
+            document.querySelectorAll('.cli-body');
+
+        existingBodies.forEach(body => {
+            if (body.id !== 'terminal-body') {
+                body.remove();
+            }
+        });
+
+        for (const term of session.terminals || []) {
+
+            if (term.id !== 1) {
+                // Create terminal DOM directly with the saved ID
+                // instead of calling addTerminal() which would
+                // corrupt state.nextTerminalId and state.terminals
+                const tabsContainer = document.getElementById('cli-tabs');
+                const tabBtn = document.createElement('div');
+                tabBtn.className = 'cli-tab';
+                tabBtn.id = `tab-btn-${term.id}`;
+                tabBtn.innerHTML = `
+                    <span class="cli-dots" style="margin-right: 6px;">
+                        <span class="dot dot-red"></span>
+                        <span class="dot dot-yellow"></span>
+                        <span class="dot dot-green"></span>
+                    </span>
+                    <span>Terminal ${term.id}</span>
+                    <button class="cli-tab-close" title="Close" aria-label="Close terminal" onclick="event.stopPropagation(); closeTerminal(${term.id})"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg></button>`;
+                tabBtn.onclick = () => switchTerminal(term.id);
+                tabsContainer.insertBefore(tabBtn, document.getElementById('btn-add-tab'));
+
+                const bodyContainer = document.createElement('div');
+                bodyContainer.className = 'cli-body';
+                bodyContainer.setAttribute('role', 'log');
+                bodyContainer.setAttribute('aria-live', 'polite');
+                bodyContainer.id = `terminal-body-${term.id}`;
+                bodyContainer.style.display = 'none';
+
+                document.getElementById('cli-area').insertBefore(
+                    bodyContainer,
+                    document.querySelector('.cli-input-bar')
+                );
+            }
+
+            const body =
+                document.getElementById(`terminal-body-${term.id}`) ||
+                (term.id === 1
+                    ? document.getElementById('terminal-body')
+                    : null);
+
+            if (!body) continue;
+
+            body.innerHTML = '';
+
+            for (const line of term.lines || []) {
+                const div = document.createElement('div');
+
+                div.className =
+                    `cli-output-block ${line.className}`;
+
+                div.textContent = line.text;
+
+                body.appendChild(div);
+            }
+        }
+
+        switchTerminal(state.activeTerminalId);
+
+        console.log('Session restored successfully');
+
+    } catch (e) {
+        console.error('Failed to restore session:', e);
+    }
+}
+
+// ─── Terminal Utility Actions ───────────────────────────────
+
+/**
+ * Extracts plain-text content from the active terminal body,
+ * collecting text from each output block line by line.
+ */
+function getTerminalText(termId = state.activeTerminalId) {
+    const termBody = document.getElementById(`terminal-body-${termId}`) || document.getElementById('terminal-body');
+    if (!termBody) return '';
+    const lines = termBody.querySelectorAll('.cli-output-block');
+    return Array.from(lines).map(el => el.textContent).join('\n');
+}
+
+/**
+ * Copies the active terminal's output to the system clipboard.
+ * Falls back to a textarea-based copy for older browsers.
+ */
+function copyTerminalOutput() {
+    const text = getTerminalText();
+    if (!text.trim()) {
+        notify('Terminal is empty — nothing to copy.', 'warning');
+        return;
+    }
+
+    if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(text).then(() => {
+            notify('Terminal output copied to clipboard.', 'success');
+        }).catch(() => {
+            _fallbackCopy(text);
+        });
+    } else {
+        _fallbackCopy(text);
+    }
+}
+
+function _fallbackCopy(text) {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.cssText = 'position:fixed;top:-9999px;left:-9999px;opacity:0;';
+    document.body.appendChild(ta);
+    ta.select();
+    try {
+        document.execCommand('copy');
+        notify('Terminal output copied to clipboard.', 'success');
+    } catch {
+        notify('Copy failed — please copy manually.', 'error');
+    }
+    document.body.removeChild(ta);
+}
+
+/**
+ * Downloads the active terminal's output as a .txt file.
+ * Filename includes the terminal ID and a timestamp for uniqueness.
+ */
+function downloadTerminalLog() {
+    const termId = state.activeTerminalId;
+    const text = getTerminalText(termId);
+    if (!text.trim()) {
+        notify('Terminal is empty — nothing to download.', 'warning');
+        return;
+    }
+
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const filename = `devshell-terminal-${termId}-${timestamp}.txt`;
+    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+    notify(`Log downloaded as "${filename}".`, 'success');
+}
+
+/**
+ * Toggles auto-scroll on/off for the active terminal.
+ * Updates the button appearance to reflect current state.
+ */
+function toggleAutoScroll() {
+    const termId = state.activeTerminalId;
+    // Default is true; flip it
+    state.autoScroll[termId] = state.autoScroll[termId] === false ? true : false;
+    const isOn = state.autoScroll[termId] !== false;
+    updateAutoScrollBtn(termId, isOn);
+    notify(`Auto-scroll ${isOn ? 'enabled' : 'disabled'} for Terminal ${termId}.`, 'info');
+}
+
+/**
+ * Updates the auto-scroll button's visual state for the given terminal.
+ */
+function updateAutoScrollBtn(termId, isOn) {
+    const btn = document.getElementById('btn-autoscroll');
+    if (!btn) return;
+    btn.classList.toggle('active', isOn);
+    btn.title = isOn ? 'Auto-scroll: On' : 'Auto-scroll: Off';
+    btn.setAttribute('aria-pressed', String(isOn));
     termBody.scrollTop = termBody.scrollHeight;
     highlightTerminalSearch();
     persistWorkspace();
@@ -1463,6 +1793,7 @@ async function restoreSession() {
 function addTerminal() {
     const id = state.nextTerminalId++;
     state.terminals.push(id);
+    state.autoScroll[id] = true; // auto-scroll on by default for new terminals
 
     const tabsContainer = document.getElementById('cli-tabs');
     const tabBtn = document.createElement('div');
@@ -1504,6 +1835,9 @@ function switchTerminal(id) {
     const activeBody = getTerminalBody(id);
     if (activeBody) activeBody.style.display = 'block';
 
+    // Sync auto-scroll button to the newly active terminal's state
+    updateAutoScrollBtn(id, state.autoScroll[id] !== false);
+
     const runStatus = document.getElementById('run-status');
     const resourcePanel = document.getElementById('resource-panel');
     const running = state.runningScripts[id];
@@ -1527,6 +1861,8 @@ function closeTerminal(id) {
     if (state.terminals.length <= 1) return;
 
     state.terminals = state.terminals.filter(t => t !== id);
+    delete state.autoScroll[id];
+
     const tabBtn = document.getElementById(`tab-btn-${id}`) || document.querySelector(`.cli-tab[data-id="${id}"]`);
     if (tabBtn) tabBtn.remove();
 
@@ -1951,6 +2287,24 @@ function bindEvents() {
     const firstTab = document.querySelector('.cli-tab[data-id="1"]');
     if (firstTab) {
         firstTab.addEventListener('click', () => switchTerminal(1));
+    }
+
+    // Terminal utility action buttons
+    const btnCopyOutput = document.getElementById('btn-copy-output');
+    if (btnCopyOutput) {
+        btnCopyOutput.addEventListener('click', copyTerminalOutput);
+    }
+
+    const btnDownloadLog = document.getElementById('btn-download-log');
+    if (btnDownloadLog) {
+        btnDownloadLog.addEventListener('click', downloadTerminalLog);
+    }
+
+    const btnAutoscroll = document.getElementById('btn-autoscroll');
+    if (btnAutoscroll) {
+        btnAutoscroll.addEventListener('click', toggleAutoScroll);
+        // Set initial visual state (auto-scroll on by default)
+        updateAutoScrollBtn(state.activeTerminalId, true);
     }
 
     // Search
@@ -2810,6 +3164,7 @@ const DebuggerConsole = (() => {
         { cmd: 'state.terminals', desc: 'List active terminal IDs', icon: 'debug', category: 'debug' },
         { cmd: 'state.cmdHistory', desc: 'View command history', icon: 'debug', category: 'debug' },
         { cmd: 'state.expandedCategories', desc: 'View expanded categories', icon: 'debug', category: 'debug' },
+        { cmd: 'state.autoScroll', desc: 'View auto-scroll state per terminal', icon: 'debug', category: 'debug' },
         { cmd: 'Object.keys(state.scripts)', desc: 'List script categories', icon: 'debug', category: 'debug' },
         { cmd: 'JSON.stringify(state, null, 2)', desc: 'Pretty print full state', icon: 'debug', category: 'debug' },
         { cmd: 'document.title', desc: 'Get page title', icon: 'cmd', category: 'js' },
@@ -2817,6 +3172,9 @@ const DebuggerConsole = (() => {
         { cmd: 'navigator.userAgent', desc: 'Get browser user agent', icon: 'cmd', category: 'js' },
         { cmd: 'performance.now()', desc: 'Get high-res timestamp', icon: 'cmd', category: 'js' },
         { cmd: 'loadScripts()', desc: 'Reload scripts from server', icon: 'script', category: 'debug' },
+        { cmd: 'copyTerminalOutput()', desc: 'Copy active terminal output to clipboard', icon: 'cmd', category: 'debug' },
+        { cmd: 'downloadTerminalLog()', desc: 'Download active terminal log as .txt', icon: 'cmd', category: 'debug' },
+        { cmd: 'toggleAutoScroll()', desc: 'Toggle auto-scroll for active terminal', icon: 'cmd', category: 'debug' },
     ];
 
     function getTime() {
