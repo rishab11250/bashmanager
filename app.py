@@ -18,12 +18,19 @@ import re
 import shutil
 import urllib.error
 from datetime import datetime, timezone
+from pathlib import Path
 from flask import Flask, request, jsonify, send_from_directory, Response
+
+from utils.validators import validate_safe_path, validate_git_branch, validate_repo_name
 
 PBKDF2_ITERATIONS = 100_000
 
 
 app = Flask(__name__, static_folder='ui', static_url_path='')
+
+@app.errorhandler(ValueError)
+def handle_validation_error(e):
+    return jsonify({"error": str(e)}), 400
 
 BASE_DIR = os.environ.get('DEV_SHELL_DATA_DIR', os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'scripts')
@@ -2265,13 +2272,6 @@ def check_lock(rel_path: str, provided_pass: str) -> bool:
     return True
 
 
-def is_safe_path(base_dir, target_path):
-    base_dir = os.path.abspath(base_dir)
-    target_path = os.path.abspath(target_path)
-
-    return os.path.commonpath([base_dir, target_path]) == base_dir
-
-
 def parse_script_metadata(filepath):
     """Parse metadata from script comment headers."""
     metadata = {
@@ -2794,12 +2794,7 @@ def get_script_content():
     if not check_lock(rel_path, password):
         return jsonify({'error': 'Locked', 'locked': True}), 401
         
-    full_path = os.path.join(SCRIPTS_DIR, rel_path)
-    full_path = os.path.normpath(full_path)
-
-    # Security check
-    if not is_safe_path(SCRIPTS_DIR, full_path):
-        return jsonify({'error': 'Invalid path'}), 403
+    full_path = str(validate_safe_path(SCRIPTS_DIR, rel_path))
 
     if not os.path.exists(full_path):
         return jsonify({'error': 'Script not found'}), 404
@@ -2969,12 +2964,7 @@ def run_script():
     if not check_lock(rel_path, password):
         return jsonify({'error': 'Locked', 'success': False}), 401
         
-    full_path = os.path.join(SCRIPTS_DIR, rel_path)
-    full_path = os.path.normpath(full_path)
-
-    # Security check
-    if not is_safe_path(SCRIPTS_DIR, full_path):
-        return jsonify({'error': 'Invalid path'}), 403
+    full_path = str(validate_safe_path(SCRIPTS_DIR, rel_path))
 
     if not os.path.exists(full_path):
         return jsonify({'error': 'Script not found'}), 404
@@ -3032,7 +3022,8 @@ def run_script():
                 text=True,
                 cwd=SCRIPTS_DIR,
                 bufsize=1,
-                universal_newlines=True
+                universal_newlines=True,
+                shell=False
             )
 
             with active_processes_lock:
@@ -3239,7 +3230,8 @@ def exec_command():
                 text=True,
                 cwd=SCRIPTS_DIR,
                 bufsize=1,
-                universal_newlines=True
+                universal_newlines=True,
+                shell=False
             )
             
             for line in iter(proc.stdout.readline, ''):
@@ -3335,17 +3327,17 @@ def save_script():
     if not filename.endswith('.sh'):
         filename += '.sh'
 
-    category = category.replace('..', '').replace('/', '').replace('\\', '')
-    filename = filename.replace('..', '').replace('/', '').replace('\\', '')
     rel_path = f'{category}/{filename}'
+    
+    # Secure path validation
+    full_path = str(validate_safe_path(SCRIPTS_DIR, rel_path))
     
     if not check_lock(rel_path, provided_pass):
         return jsonify({'error': 'Locked', 'success': False}), 401
 
-    cat_dir = os.path.join(SCRIPTS_DIR, category)
-    os.makedirs(cat_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(full_path), exist_ok=True)
 
-    full_path = os.path.join(cat_dir, filename)
+    full_path = os.path.join(os.path.dirname(full_path), filename)
     with open(full_path, 'w', encoding='utf-8', newline='\n') as f:
         f.write(content)
 
@@ -3361,11 +3353,7 @@ def delete_script():
     if not check_lock(rel_path, provided_pass):
         return jsonify({'error': 'Locked', 'success': False}), 401
         
-    full_path = os.path.join(SCRIPTS_DIR, rel_path)
-    full_path = os.path.normpath(full_path)
-
-    if not is_safe_path(SCRIPTS_DIR, full_path):
-        return jsonify({'error': 'Invalid path'}), 403
+    full_path = str(validate_safe_path(SCRIPTS_DIR, rel_path))
 
     if os.path.exists(full_path):
         os.remove(full_path)
@@ -3501,22 +3489,11 @@ def import_github():
             'success': False
         }), 400
 
-    # Sanitize paths
-    category = (
-        category
-        .replace('..', '')
-        .replace('/', '')
-        .replace('\\', '')
-    )
-
-    filename = (
-        filename
-        .replace('..', '')
-        .replace('/', '')
-        .replace('\\', '')
-    )
-
     rel_path = f'{category}/{filename}'
+    
+    # Secure path validation
+    full_path = str(validate_safe_path(SCRIPTS_DIR, rel_path))
+
     # Respect existing lock protection
     if not check_lock(rel_path, ''):
         return jsonify({
@@ -3524,9 +3501,8 @@ def import_github():
             'success': False
         }), 401
 
-    cat_dir = os.path.join(SCRIPTS_DIR, category)
-    os.makedirs(cat_dir, exist_ok=True)
-    full_path = os.path.join(cat_dir, filename)
+    os.makedirs(os.path.dirname(full_path), exist_ok=True)
+    full_path = os.path.join(os.path.dirname(full_path), filename)
 
     with open(
         full_path,
@@ -3554,40 +3530,39 @@ def raise_pr():
     if not rel_path:
         return jsonify({'error': 'No script path provided', 'success': False}), 400
 
-    full_path = os.path.join(SCRIPTS_DIR, rel_path)
-    full_path = os.path.normpath(full_path)
+    full_path = str(validate_safe_path(SCRIPTS_DIR, rel_path))
 
-    # Security check: prevent path traversal outside scripts directory
-    if not is_safe_path(SCRIPTS_DIR, full_path):
-        return jsonify({'error': 'Invalid path'}), 403
+    if target_repo:
+        target_repo = validate_repo_name(target_repo)
+    branch_name = validate_git_branch(branch_name)
 
     try:
         # Check if we are in a git repo
-        subprocess.run(['git', 'rev-parse', '--is-inside-work-tree'], check=True, capture_output=True)
+        subprocess.run(['git', 'rev-parse', '--is-inside-work-tree'], check=True, capture_output=True, shell=False)
         
         # 1. Create new local branch for the contribution
-        checkout_existing = subprocess.run(['git', 'checkout', branch_name], capture_output=True)
+        checkout_existing = subprocess.run(['git', 'checkout', branch_name], capture_output=True, shell=False)
         if checkout_existing.returncode != 0:
-            subprocess.run(['git', 'checkout', '-b', branch_name], check=True, capture_output=True)
+            subprocess.run(['git', 'checkout', '-b', branch_name], check=True, capture_output=True, shell=False)
         
         # 2. Stage only the specific script file
-        subprocess.run(['git', 'add', full_path], check=True, capture_output=True)
+        subprocess.run(['git', 'add', full_path], check=True, capture_output=True, shell=False)
         
         # 3. Commit the changes
-        subprocess.run(['git', 'commit', '-m', commit_msg], check=True, capture_output=True)
+        subprocess.run(['git', 'commit', '-m', commit_msg], check=True, capture_output=True, shell=False)
         
         # 4. Push to target remote
         # If the user provided a specific target repository URL, we push directly to it.
         # Otherwise, we push to the default 'origin'.
         remote_to_push = target_repo if target_repo else 'origin'
-        subprocess.run(['git', 'push', '-u', remote_to_push, branch_name], check=True, capture_output=True)
+        subprocess.run(['git', 'push', '-u', remote_to_push, branch_name], check=True, capture_output=True, shell=False)
         
         # 5. Generate a GitHub PR Link
         # If an external repo URL was provided, use that to construct the base URL.
         if target_repo:
             remote_url = target_repo.replace('.git', '')
         else:
-            remote_res = subprocess.run(['git', 'remote', 'get-url', 'origin'], check=True, capture_output=True, text=True)
+            remote_res = subprocess.run(['git', 'remote', 'get-url', 'origin'], check=True, capture_output=True, text=True, shell=False)
             remote_url = remote_res.stdout.strip().replace('.git', '')
             
         if remote_url.startswith('git@github.com:'):
@@ -3598,7 +3573,7 @@ def raise_pr():
         
         # 6. Switch back to the main branch to keep the workspace stable
         default_branch = get_default_branch()
-        subprocess.run(['git', 'checkout', default_branch], check=True, capture_output=True)
+        subprocess.run(['git', 'checkout', default_branch], check=True, capture_output=True, shell=False)
         
         return jsonify({'success': True, 'pr_url': pr_url, 'branch': branch_name})
         
@@ -3606,7 +3581,7 @@ def raise_pr():
         err_msg = e.stderr.decode() if e.stderr else str(e)
         # Attempt recovery to main
         default_branch = get_default_branch()
-        subprocess.run(['git', 'checkout', default_branch], capture_output=True)
+        subprocess.run(['git', 'checkout', default_branch], capture_output=True, shell=False)
         return jsonify({'error': err_msg, 'success': False}), 500
     except Exception as e:
         return jsonify({'error': str(e), 'success': False}), 500
@@ -3642,7 +3617,8 @@ def get_default_branch():
             ['git', 'symbolic-ref', 'refs/remotes/origin/HEAD'],
             capture_output=True,
             text=True,
-            check=True
+            check=True,
+            shell=False
         )
 
         ref = result.stdout.strip()
