@@ -6,12 +6,14 @@ DevShell is a lightweight, zero-database local script manager and execution envi
 
 - **Zero-DB Architecture:** Operates entirely on the local file system. Scripts are read directly from a structured `scripts/` directory. State and security parameters are maintained in local JSON files (`locks.json`, `favorites.json`).
 - **Real-Time Execution Engine:** Utilizes Server-Sent Events (SSE) to stream subprocess outputs (stdout/stderr) immediately to the frontend.
-- **Multi-Tab Terminal:** Supports isolated, concurrent terminal execution environments. 
+- **Multi-Tab Terminal:** Supports multiple terminal tabs in the UI; each tab runs independently but shares the same backend process manager.
 - **Persistent Execution History:** Stores timestamped command and script runs, failed executions, and per-run log files for later search and export.
-- **Process Resource Monitoring:** Features a dedicated background thread for tracking isolated CPU and memory usage statistics attributed strictly to the active script process.
+- **Process Resource Monitoring:** Tracks CPU and memory usage of the script process via psutil during execution. Child processes spawned by the script are not individually tracked.
 - **In-Memory Search Highlights:** Non-destructive DOM traversal algorithms allow live keyword grepping within active terminal streams.
-- **Local Password Locking:** Scripts can be securely locked behind a PBKDF2/SHA-256 local hash to prevent unauthorized reading or execution.
+- **Local Password Locking:** Scripts can be securely locked behind a SHA-256 local hash (single-round, no salt) to prevent unauthorized reading or execution.
 - **GitHub Integration:** Pull scripts directly from public raw GitHub URLs via the interface.
+- **Execution History & Logs:** All script and command runs are recorded to logs/history.jsonl with exit codes, duration, and output excerpts. Logs are auto-pruned after 30 days or 250 files.
+- **Git PR Push (Experimental):** Scripts can be pushed to a branch and a GitHub pull request link generated via the /api/git/pr endpoint. This feature is experimental and requires git to be configured in the project directory.
 
 ## System Architecture
 
@@ -35,7 +37,7 @@ To protect locked scripts from unauthorized access, DevShell uses a secure passw
 
 - Python 3.8+
 - Node.js 18+ and npm (For the Electron wrapper)
-- A Unix-like bash terminal equivalent available in system PATH (Git Bash, WSL, or native Linux/macOS bash).
+- A shell available in system PATH — bash (Linux/macOS), Git Bash, or WSL on Windows. On Windows, cmd.exe is used as fallback if no bash is found.
 
 ## Installation
 
@@ -43,7 +45,7 @@ To protect locked scripts from unauthorized access, DevShell uses a secure passw
 
 ```bash
 git clone <repository_url>
-cd DevShell
+cd bashmanager
 ```
 
 ### 2. Backend Setup
@@ -51,7 +53,7 @@ cd DevShell
 It is highly recommended to use a virtual environment for the Python backend dependencies.
 
 ```bash
-pip install flask psutil
+pip install -r requirements.txt
 ```
 
 ### 3. Frontend / Desktop Setup
@@ -110,7 +112,7 @@ npm run build
 
 - `app.py`: Main Flask application, API routing, subprocess handling, and SSE response generation.
 - `logs/`: Persistent execution history, failed-command records, and per-run `.log` files.
-- `scripts/`: Root directory for user scripts. Scripts are organized dynamically based on subfolders (categories).
+- `scripts/`: Root directory for user scripts. Any subdirectory is automatically treated as a script category.
 - `ui/`: Contains all frontend assets (`index.html`, `style.css`, `app.js`).
 - `main.js`: Electron initialization and window management.
 
